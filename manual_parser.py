@@ -13,8 +13,20 @@ def _clean_number(raw: str) -> str:
     return raw.strip().replace(",", "")
 
 
+COIN_ALIASES = {
+    "BTC": ["bitcoin", "bit coin", "btc"],
+    "ETH": ["ethereum", "ether", "eth"],
+    "SOL": ["solana", "sol"],
+    "ADA": ["cardano", "ada"],
+    "DOGE": ["dogecoin", "doge"],
+    "XRP": ["ripple", "xrp"],
+    "BNB": ["bnb", "binance coin"],
+}
+
+
 def _find_symbol(command: str, allowed_symbols: List[str]) -> str:
     text = command.upper()
+    ascii_text = _strip_accents(command.lower())
     allowed = [s.upper().strip() for s in allowed_symbols if s.strip()]
     for sym in allowed:
         if sym in text:
@@ -22,6 +34,9 @@ def _find_symbol(command: str, allowed_symbols: List[str]) -> str:
         base = sym.replace("USDT", "")
         if re.search(rf"\b{re.escape(base)}\b", text):
             return sym
+        for alias in COIN_ALIASES.get(base, []):
+            if re.search(rf"\b{re.escape(alias)}\b", ascii_text):
+                return sym
     return ""
 
 

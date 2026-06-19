@@ -122,7 +122,7 @@ Market selection rules:
 - Spot has no short. Never return OPEN_SHORT with category="spot".
 - For spot buy, use order_usdt or margin_usdt as the USDT amount to buy. Spot does not use leverage; even if the user mentions leverage with spot, omit leverage or set it to 1 and never convert a clear spot order into futures.
 - For spot sell, use qty if user gives coin quantity; use order_usdt if user gives USDT value; use SPOT_SELL_ALL if user says sell all/bán hết.
-- For futures, margin_usdt means account margin/capital used for the trade, not notional.
+- For futures, margin_usdt means account margin/capital used for the trade, not notional. If the direct command requests futures/long/short but does not specify leverage, use risk_config.max_leverage as the default leverage.
 - For OPEN_LONG: stop_loss must be below current price and take_profit above current price.
 - For OPEN_SHORT: stop_loss must be above current price and take_profit below current price.
 - For SPOT_BUY: stop_loss must be below current price and take_profit above current price.

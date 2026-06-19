@@ -1,7 +1,7 @@
 import os
 import time
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_UP
 from typing import Any, Dict, Optional
 
 from bybit_client import round_down_to_step
@@ -318,13 +318,29 @@ class RiskGuard:
         if margin > self.config.max_margin_per_trade_usdt:
             raise RiskError(f"margin_usdt={margin} vượt MAX_MARGIN_PER_TRADE_USDT={self.config.max_margin_per_trade_usdt}.")
 
+        min_notional_required = market_price * min_qty
+        if min_notional_required > self.config.max_notional_usdt:
+            raise RiskError(
+                f"Không thể mở {symbol} futures với cấu hình hiện tại: giá trị lệnh tối thiểu theo minQty={min_qty} "
+                f"là khoảng {min_notional_required.quantize(Decimal('0.01'))} USDT, nhưng MAX_NOTIONAL_USDT={self.config.max_notional_usdt}. "
+                "Hãy tăng giới hạn giá trị vị thế tối đa hoặc chọn symbol có minQty thấp hơn."
+            )
+
         notional = margin * Decimal(leverage)
         if notional > self.config.max_notional_usdt:
             raise RiskError(f"Notional={notional} vượt MAX_NOTIONAL_USDT={self.config.max_notional_usdt}.")
 
         qty = round_down_to_step(notional / market_price, qty_step)
         if qty <= 0 or qty < min_qty:
-            raise RiskError(f"qty={qty} nhỏ hơn minQty={min_qty} sau khi làm tròn.")
+            min_margin_current_lev = (min_notional_required / Decimal(leverage)).quantize(Decimal('0.01'), rounding=ROUND_UP)
+            min_leverage_needed = (min_notional_required / margin).to_integral_value(rounding=ROUND_UP) if margin > 0 else Decimal('0')
+            raise RiskError(
+                f"Lệnh futures {symbol} quá nhỏ: vốn {margin} USDT x đòn bẩy {leverage}x = notional {notional} USDT, "
+                f"chưa đủ minQty={min_qty} (~{min_notional_required.quantize(Decimal('0.01'))} USDT). "
+                f"Cần tối thiểu khoảng {min_margin_current_lev} USDT ở {leverage}x"
+                + (f" hoặc đòn bẩy tối thiểu {int(min_leverage_needed)}x với vốn {margin} USDT." if min_leverage_needed > 0 else ".")
+                + " Hãy tăng vốn, tăng max leverage/risk setting, hoặc chọn symbol có minQty thấp hơn."
+            )
 
         self._validate_tp_sl_direction(raw, market_price, take_profit, stop_loss)
 

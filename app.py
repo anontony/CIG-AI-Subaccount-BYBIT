@@ -2,6 +2,7 @@ import asyncio
 import json
 import hashlib
 import time
+import re
 from decimal import Decimal
 from typing import Any, Dict, Optional
 
@@ -28,7 +29,7 @@ from strategy_parser import parse_strategy_prompt, summarize_strategy_directives
 
 load_dotenv()
 
-app = FastAPI(title="CIG AI Subaccount", version="24.0.0")
+app = FastAPI(title="CIG AI Subaccount", version="26.0.0")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 store = UserStore()
 runtimes = RuntimeManager(log_store=store)
@@ -337,6 +338,76 @@ def is_wait_action(action: dict) -> bool:
 def direct_wait_error(raw_decision: dict) -> str:
     reason = str((raw_decision or {}).get("reason") or "Lệnh trực tiếp chưa đủ thông tin để thực thi.").strip()
     return "Lệnh trực tiếp chưa thể thực thi: " + reason[:260]
+
+
+def _direct_command_has_explicit_leverage(command: str) -> bool:
+    text = (command or "").lower()
+    return bool(re.search(r"(đòn|don|đòn bẩy|don bay|leverage|lev)\s*[:=]?\s*\d+|\bx\s*\d+\b|\b\d+\s*x\b", text))
+
+
+def apply_direct_futures_defaults(command: str, raw_decision: Dict[str, Any], guard: RiskGuard) -> Dict[str, Any]:
+    decision = dict(raw_decision or {})
+    action = str(decision.get("action") or "").upper().strip()
+    if action not in {"OPEN_LONG", "OPEN_SHORT"}:
+        return decision
+    category = str(decision.get("category") or guard.config.default_category or "linear").lower().strip()
+    if category in {"", "auto", "spot"}:
+        category = "linear"
+    if category not in {"linear", "inverse"}:
+        return decision
+    decision["category"] = category
+    if not _direct_command_has_explicit_leverage(command):
+        try:
+            current_lev = int(decision.get("leverage") or 0)
+        except Exception:
+            current_lev = 0
+        if current_lev <= 1 and guard.config.max_leverage > 1:
+            decision["leverage"] = guard.config.max_leverage
+            reason = str(decision.get("reason") or "").strip()
+            add = f"Không thấy đòn bẩy trong lệnh trực tiếp; dùng max leverage cấu hình {guard.config.max_leverage}x."
+            decision["reason"] = (reason + " " + add).strip() if reason else add
+    return decision
+
+
+
+
+def merge_direct_parser_with_ai(command: str, ai_decision: Dict[str, Any], guard: RiskGuard) -> Dict[str, Any]:
+    """Preserve explicit user parameters even when the AI misses them.
+
+    Direct Command is execution-oriented. The AI may correctly infer the action
+    but miss Vietnamese shorthand such as "bitcoin", "bẩy x10", "10u".
+    This deterministic parser does not replace AI reasoning; it only fills or
+    overrides explicit fields found in the user command before Risk Guard runs.
+    """
+    decision = dict(ai_decision or {})
+    parsed = parse_direct_command(command, allowed_symbols_from_guard(guard), guard.config.default_category)
+    if is_wait_action(parsed):
+        return apply_direct_futures_defaults(command, decision, guard)
+
+    ai_action = str(decision.get("action") or "").upper().strip()
+    parser_action = str(parsed.get("action") or "").upper().strip()
+    if not ai_action or ai_action in {"WAIT", "HOLD", "NO_TRADE"}:
+        return apply_direct_futures_defaults(command, parsed, guard)
+
+    compatible = (
+        ai_action == parser_action
+        or {ai_action, parser_action} <= {"OPEN_LONG", "OPEN_SHORT"}
+        or {ai_action, parser_action} <= {"SPOT_BUY", "SPOT_SELL", "SPOT_SELL_ALL"}
+    )
+    if not compatible:
+        return apply_direct_futures_defaults(command, decision, guard)
+
+    for key in [
+        "symbol", "category", "leverage", "margin_usdt", "order_usdt", "qty",
+        "take_profit", "stop_loss", "take_profit_pct", "stop_loss_pct",
+    ]:
+        val = parsed.get(key)
+        if val not in (None, ""):
+            decision[key] = val
+
+    reason = str(decision.get("reason") or "").strip()
+    decision["reason"] = (reason + " Đã đối chiếu parser nội bộ để giữ đúng thông tin user nhập.").strip()
+    return apply_direct_futures_defaults(command, decision, guard)
 
 
 def _prompt_schedule_key(prompt: str, meta: Dict[str, Any]) -> str:
@@ -1088,6 +1159,7 @@ async def direct_command(payload: CommandIn, user: Dict[str, Any] = Depends(curr
                 await runtime.log("WARN", msg)
                 raise RiskError(msg)
             await runtime.log("INFO", "Bộ đọc lệnh đơn giản đã chuyển câu lệnh thành tín hiệu giao dịch.")
+        raw_decision = merge_direct_parser_with_ai(command, raw_decision, guard)
         result = await analyze_and_execute(user_id=user["id"], runtime=runtime, settings=settings, raw_decision=raw_decision, snapshots=snapshots)
         await runtime.log("INFO", summarize_trade_result(result))
         return {"ok": True, "mode": "trade_command", "ai_parse": raw_decision, "result": result, "summary": summarize_trade_result(result)}
