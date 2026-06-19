@@ -29,7 +29,7 @@ from strategy_parser import parse_strategy_prompt, summarize_strategy_directives
 
 load_dotenv()
 
-app = FastAPI(title="CIG AI Subaccount", version="27.0.0")
+app = FastAPI(title="CIG AI Subaccount", version="28.0.0")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 store = UserStore()
 runtimes = RuntimeManager(log_store=store)
@@ -123,6 +123,10 @@ def make_risk_guard(settings: Dict[str, Any], runtime: UserRuntimeState) -> Risk
 
 def allowed_symbols_from_guard(guard: RiskGuard) -> list[str]:
     return sorted(guard.config.allowed_symbols)
+
+
+def json_safe(value: Any) -> Any:
+    return json.loads(json.dumps(value, ensure_ascii=False, default=str))
 
 
 def workspace_preflight(ws: Dict[str, Any], runtime: UserRuntimeState) -> Dict[str, Any]:
@@ -806,7 +810,7 @@ async def bot_loop_safe(user_id: int, stop_event: asyncio.Event) -> None:
                 )
                 if is_wait_action(raw_decision) and fallback:
                     raw_decision = fallback
-                    await runtime.log("INFO", "AI trả WAIT nhưng prompt có lịch DCA rõ ràng; bot dùng parser để tạo tín hiệu và vẫn giữ cooldown theo lịch.")
+                    await runtime.log("INFO", "AI trả WAIT nhưng prompt có lịch DCA rõ ràng; bot dùng parser để tạo tín hiệu và vẫn giữ lịch riêng của prompt.")
                 await runtime.log("INFO", "AI đã phân tích chiến lược và tạo tín hiệu.")
 
             try:
@@ -882,13 +886,22 @@ async def run_saved_prompt_once(user_id: int) -> Dict[str, Any]:
         )
         if is_wait_action(raw_decision) and fallback:
             raw_decision = fallback
-            await runtime.log("INFO", "AI trả WAIT nhưng prompt có lịch DCA rõ ràng; bot dùng parser để tạo tín hiệu và vẫn giữ cooldown theo lịch.")
+            await runtime.log("INFO", "AI trả WAIT nhưng prompt có lịch DCA rõ ràng; bot dùng parser để tạo tín hiệu và vẫn giữ lịch riêng của prompt.")
         await runtime.log("INFO", "AI đã phân tích prompt đã lưu và tạo tín hiệu.")
-    result = await analyze_and_execute(user_id=user_id, runtime=runtime, settings=settings, raw_decision=raw_decision, snapshots=snapshots)
+    try:
+        result = await analyze_and_execute(user_id=user_id, runtime=runtime, settings=settings, raw_decision=raw_decision, snapshots=snapshots)
+    except (RiskError, BybitAPIError) as exc:
+        msg = f"Lưu và chạy một lần bị chặn/thất bại: {exc}"
+        await runtime.log("WARN", msg)
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        msg = f"Lưu và chạy một lần lỗi hệ thống: {type(exc).__name__}: {exc}"
+        await runtime.log("ERROR", msg)
+        raise HTTPException(status_code=500, detail=msg)
     if str((result.get("normalized") or {}).get("action") or "").upper() != "WAIT":
         _mark_scheduled_prompt_executed(user_id, prompt, prompt_meta)
     await runtime.log("INFO", summarize_trade_result(result))
-    return {"ok": True, "ai_decision": raw_decision, "result": result, "summary": summarize_trade_result(result), "prompt_meta": prompt_meta}
+    return json_safe({"ok": True, "ai_decision": raw_decision, "result": result, "summary": summarize_trade_result(result), "prompt_meta": prompt_meta})
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1010,19 +1023,12 @@ async def save_prompt(payload: PromptIn, user: Dict[str, Any] = Depends(current_
     if meta.get("interval_seconds"):
         seconds = int(meta["interval_seconds"])
         auto_updates["loop_interval_seconds"] = seconds
-        # Prompt schedule also controls cooldown to prevent repeated orders before the next scheduled run.
-        current_cooldown = int(ws["settings"].get("min_seconds_between_trades") or 0)
-        if seconds > current_cooldown:
-            auto_updates["min_seconds_between_trades"] = seconds
     if auto_updates:
         store.update_settings(user["id"], auto_updates)
     await runtime.log("INFO", "Đã lưu prompt. Prompt cũ đã bị xoá/ghi đè trong workspace này.")
     await runtime.log("INFO", "Prompt parser ghi nhận: " + summarize_strategy_directives(meta))
     if auto_updates.get("loop_interval_seconds"):
-        extra = ""
-        if auto_updates.get("min_seconds_between_trades"):
-            extra = f"; cooldown chống spam cũng đặt thành {auto_updates['min_seconds_between_trades']} giây"
-        await runtime.log("INFO", f"Đã tự đồng bộ chu kỳ bot theo prompt: {auto_updates['loop_interval_seconds']} giây{extra}.")
+        await runtime.log("INFO", f"Đã tự đồng bộ chu kỳ bot theo prompt: {auto_updates['loop_interval_seconds']} giây. Cooldown chống spam đã tắt; chỉ giữ lịch riêng của prompt.")
     return {
         "ok": True,
         "message": "Prompt đã được lưu và ghi đè prompt cũ trong workspace này.",
@@ -1138,13 +1144,8 @@ async def direct_command(payload: CommandIn, user: Dict[str, Any] = Depends(curr
             if prompt_meta.get("interval_seconds"):
                 seconds = int(prompt_meta["interval_seconds"])
                 updates = {"loop_interval_seconds": seconds}
-                current_cooldown = int(settings.get("min_seconds_between_trades") or 0)
-                if seconds > current_cooldown:
-                    updates["min_seconds_between_trades"] = seconds
                 saved = store.update_settings(user["id"], updates)
                 result["settings_changed"]["loop_interval_seconds"] = saved.get("loop_interval_seconds")
-                if "min_seconds_between_trades" in updates:
-                    result["settings_changed"]["min_seconds_between_trades"] = saved.get("min_seconds_between_trades")
             result["prompt_changed"] = True
             result["prompt_meta_summary"] = summarize_strategy_directives(prompt_meta)
 
@@ -1211,7 +1212,7 @@ async def direct_command(payload: CommandIn, user: Dict[str, Any] = Depends(curr
         raw_decision = merge_direct_parser_with_ai(command, raw_decision, guard)
         result = await analyze_and_execute(user_id=user["id"], runtime=runtime, settings=settings, raw_decision=raw_decision, snapshots=snapshots)
         await runtime.log("INFO", summarize_trade_result(result))
-        return {"ok": True, "mode": "trade_command", "ai_parse": raw_decision, "result": result, "summary": summarize_trade_result(result)}
+        return json_safe({"ok": True, "mode": "trade_command", "ai_parse": raw_decision, "result": result, "summary": summarize_trade_result(result)})
     except (RiskError, BybitAPIError) as exc:
         await runtime.log("WARN", f"Lệnh trực tiếp bị chặn/thất bại: {exc}")
         raise HTTPException(status_code=400, detail=str(exc))

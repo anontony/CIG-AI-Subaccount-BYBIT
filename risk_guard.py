@@ -43,7 +43,7 @@ class RiskConfig:
             require_tp_sl=os.getenv("REQUIRE_TP_SL", "true").strip().lower() == "true",
             default_take_profit_pct=Decimal(os.getenv("DEFAULT_TAKE_PROFIT_PCT", "1.2")),
             default_stop_loss_pct=Decimal(os.getenv("DEFAULT_STOP_LOSS_PCT", "0.6")),
-            min_seconds_between_trades=int(os.getenv("MIN_SECONDS_BETWEEN_TRADES", "60")),
+            min_seconds_between_trades=int(os.getenv("MIN_SECONDS_BETWEEN_TRADES", "0")),
         )
 
     @classmethod
@@ -64,7 +64,7 @@ class RiskConfig:
             require_tp_sl=bool(settings.get("require_tp_sl", True)),
             default_take_profit_pct=Decimal(str(settings.get("default_take_profit_pct") or "1.2")),
             default_stop_loss_pct=Decimal(str(settings.get("default_stop_loss_pct") or "0.6")),
-            min_seconds_between_trades=int(settings.get("min_seconds_between_trades") or 60),
+            min_seconds_between_trades=int(settings.get("min_seconds_between_trades") or 0),
         )
 
     @property
@@ -185,10 +185,9 @@ class RiskGuard:
     def _check_frequency(self, daily_trade_count: int) -> None:
         if daily_trade_count >= self.config.max_daily_trades:
             raise RiskError(f"Đã đạt MAX_DAILY_TRADES={self.config.max_daily_trades}.")
-        now = time.time()
-        if self.last_trade_ts and now - self.last_trade_ts < self.config.min_seconds_between_trades:
-            remain = int(self.config.min_seconds_between_trades - (now - self.last_trade_ts))
-            raise RiskError(f"Cooldown chống spam lệnh còn {remain}s.")
+        # Global anti-spam cooldown is intentionally disabled.
+        # Scheduled prompts still use their own interval gate, for example 10 USDT/1h.
+        return
 
 
     def _apply_explicit_tp_sl_pct(self, raw: str, action: Dict[str, Any], market_price: Decimal) -> tuple[Optional[Decimal], Optional[Decimal]]:

@@ -1,4 +1,15 @@
-# CIG AI Subaccount
+# CIG AI Subaccount Clean V28
+
+AI Trading Agent cho Bybit Sub-account. Bản Clean V28 là bản sạch dữ liệu, tối ưu token và đã tắt cooldown chống spam toàn cục. Prompt có lịch như `10 USDT/1h` vẫn được scheduler riêng kiểm soát để không mua lặp liên tục.
+
+## Điểm mới V28
+
+- Tắt global cooldown chống spam lệnh.
+- Không tự set `min_seconds_between_trades` theo prompt nữa.
+- `Run Once` không còn trả lỗi mù `Internal Server Error` khi Bybit/Risk Guard chặn; hệ thống sẽ log rõ nguyên nhân.
+- Giữ cơ chế scheduler riêng cho prompt có chu kỳ như `/1h`, `mỗi 1 giờ`, `mỗi ngày`.
+- Giữ tối ưu token: lệnh rõ ràng dùng parser nội bộ, không gọi AI không cần thiết.
+
 
 **CIG AI Subaccount** là dashboard AI dùng để quản lý Bybit sub-account theo từng user/workspace riêng. Mỗi user có API key riêng, prompt riêng, cấu hình rủi ro riêng, live log riêng và bảng theo dõi lệnh riêng.
 
@@ -89,7 +100,7 @@ Trước khi bot thực thi bất kỳ tín hiệu nào, Risk Guard sẽ kiểm 
 - Vốn mỗi lệnh không vượt giới hạn.
 - Notional không vượt giới hạn.
 - Có TP/SL nếu bật yêu cầu bắt buộc.
-- Cooldown giữa các lệnh.
+- Cooldown chống spam toàn cục đã tắt; prompt có lịch riêng như `/1h` vẫn được scheduler canh đúng chu kỳ.
 - Giới hạn số lệnh/ngày.
 
 ### Theo dõi lệnh
@@ -416,7 +427,7 @@ Khi parser nhận được thời gian, app sẽ tự set:
 
 ```text
 loop_interval_seconds
-min_seconds_between_trades
+min_seconds_between_trades = 0 (không còn dùng để chặn lệnh)
 ```
 
 ---
@@ -557,7 +568,7 @@ Checklist trước khi bật lệnh thật:
 - Kiểm tra max leverage.
 - Kiểm tra max margin/order.
 - Kiểm tra TP/SL mặc định.
-- Kiểm tra cooldown.
+- Không dùng cooldown chống spam toàn cục. Nếu prompt có `/1h`, scheduler riêng vẫn canh 1 giờ/lần.
 - Theo dõi Live Log và bảng lệnh.
 
 ---

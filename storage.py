@@ -34,7 +34,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "require_tp_sl": True,
     "default_take_profit_pct": "1.2",
     "default_stop_loss_pct": "0.6",
-    "min_seconds_between_trades": 60,
+    "min_seconds_between_trades": 0,
     "loop_interval_seconds": 30,
     "ai_cost_saver": True,
     "last_prompt_trade_key": "",
@@ -329,8 +329,8 @@ class UserStore:
             "take_profit": str(trade.get("take_profit") or ""),
             "stop_loss": str(trade.get("stop_loss") or ""),
             "reason": str(trade.get("reason") or "")[:800],
-            "normalized_json": json.dumps(trade.get("normalized") or {}, ensure_ascii=False),
-            "execution_json": json.dumps(trade.get("execution") or {}, ensure_ascii=False),
+            "normalized_json": json.dumps(trade.get("normalized") or {}, ensure_ascii=False, default=str),
+            "execution_json": json.dumps(trade.get("execution") or {}, ensure_ascii=False, default=str),
         }
         with self._connect() as conn:
             cur = conn.execute(
