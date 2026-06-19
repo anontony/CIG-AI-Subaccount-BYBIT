@@ -23,7 +23,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "bybit_env": "testnet",
     "recv_window": "5000",
     "openai_api_key": "",
-    "openai_model": "gpt-5.5",
+    "openai_model": "gpt-4o-mini",
     "allowed_symbols": "BTCUSDT,ETHUSDT",
     "default_category": "auto",
     "dry_run": True,
@@ -36,6 +36,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "default_stop_loss_pct": "0.6",
     "min_seconds_between_trades": 60,
     "loop_interval_seconds": 30,
+    "ai_cost_saver": True,
     "last_prompt_trade_key": "",
     "last_prompt_trade_ts": "0",
 }
@@ -403,7 +404,7 @@ def normalize_username(username: str) -> str:
 
 
 def normalize_setting_value(key: str, value: Any) -> Any:
-    if key in {"dry_run", "require_tp_sl"}:
+    if key in {"dry_run", "require_tp_sl", "ai_cost_saver"}:
         if isinstance(value, bool):
             return value
         return str(value).strip().lower() in {"1", "true", "yes", "on"}

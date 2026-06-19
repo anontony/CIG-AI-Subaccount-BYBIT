@@ -14,7 +14,7 @@ class DecisionEngine:
 
     def __init__(self, *, api_key: Optional[str] = None, model: Optional[str] = None) -> None:
         self.api_key = (api_key if api_key is not None else os.getenv("OPENAI_API_KEY", "")).strip()
-        self.model = (model if model is not None else os.getenv("OPENAI_MODEL", "gpt-5.5")).strip()
+        self.model = (model if model is not None else os.getenv("OPENAI_MODEL", "gpt-4o-mini")).strip()
         self.client = AsyncOpenAI(api_key=self.api_key) if (AsyncOpenAI and self.api_key) else None
 
     @property
@@ -49,7 +49,7 @@ class DecisionEngine:
 
         # Newer OpenAI models reject the legacy `max_tokens` parameter.
         # Use `max_completion_tokens` first, then fallback for older compatible models.
-        response = await self._create_chat_completion(base_kwargs, max_output_tokens=650)
+        response = await self._create_chat_completion(base_kwargs, max_output_tokens=260)
         content = response.choices[0].message.content or "{}"
         try:
             data = json.loads(content)
@@ -137,7 +137,7 @@ Market selection rules:
 def _skill_block(skill_context: str) -> str:
     if not skill_context:
         return ""
-    return "\nBYBIT SKILL CONTEXT - local/auto-updated cache:\n" + skill_context[:9000] + "\nEND BYBIT SKILL CONTEXT.\n"
+    return "\nBYBIT SKILL CONTEXT - local/auto-updated cache:\n" + skill_context[:1800] + "\nEND BYBIT SKILL CONTEXT.\n"
 
 
 def _decision_system_prompt(skill_context: str = "") -> str:

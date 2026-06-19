@@ -29,7 +29,7 @@ from strategy_parser import parse_strategy_prompt, summarize_strategy_directives
 
 load_dotenv()
 
-app = FastAPI(title="CIG AI Subaccount", version="26.0.0")
+app = FastAPI(title="CIG AI Subaccount", version="27.0.0")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 store = UserStore()
 runtimes = RuntimeManager(log_store=store)
@@ -65,6 +65,7 @@ class SettingsIn(BaseModel):
     default_stop_loss_pct: Optional[str] = None
     min_seconds_between_trades: Optional[int] = None
     loop_interval_seconds: Optional[int] = None
+    ai_cost_saver: Optional[bool] = None
 
 
 class CommandIn(BaseModel):
@@ -110,7 +111,7 @@ def make_client(settings: Dict[str, Any]) -> BybitClient:
 def make_engine(settings: Dict[str, Any]) -> DecisionEngine:
     return DecisionEngine(
         api_key=str(settings.get("openai_api_key") or ""),
-        model=str(settings.get("openai_model") or "gpt-5.5"),
+        model=str(settings.get("openai_model") or "gpt-4o-mini"),
     )
 
 
@@ -571,6 +572,42 @@ async def build_snapshots_for_guard(client: BybitClient, guard: RiskGuard) -> Di
     return snapshots
 
 
+
+
+def _compact_snapshot_for_ai(snapshots: Dict[str, Any]) -> Dict[str, Any]:
+    """Trim Bybit snapshots before sending them to the LLM."""
+    compact: Dict[str, Any] = {}
+    for key, snap in (snapshots or {}).items():
+        if not isinstance(snap, dict):
+            continue
+        if snap.get("error"):
+            compact[key] = {"error": snap.get("error")}
+            continue
+        ticker = snap.get("ticker") or {}
+        indicators = snap.get("indicators_15m") or {}
+        positions = snap.get("positions") or []
+        compact_positions = []
+        for pos in positions[:2] if isinstance(positions, list) else []:
+            if isinstance(pos, dict):
+                compact_positions.append({
+                    "side": pos.get("side"),
+                    "size": pos.get("size"),
+                    "avgPrice": pos.get("avgPrice"),
+                    "unrealisedPnl": pos.get("unrealisedPnl"),
+                })
+        compact[key] = {
+            "symbol": snap.get("symbol"),
+            "category": snap.get("category"),
+            "price": ticker.get("lastPrice") or ticker.get("markPrice"),
+            "bid1Price": ticker.get("bid1Price"),
+            "ask1Price": ticker.get("ask1Price"),
+            "price24hPcnt": ticker.get("price24hPcnt"),
+            "volume24h": ticker.get("volume24h"),
+            "indicators_15m": indicators,
+            "positions": compact_positions,
+        }
+    return compact
+
 async def get_instrument_filters(client: BybitClient, symbol: str, category: str) -> tuple[Decimal, Decimal, Decimal | None, Decimal]:
     instrument = await client.get_instrument(symbol, category)
     lot = instrument.get("lotSizeFilter", {}) or {}
@@ -753,19 +790,24 @@ async def bot_loop_safe(user_id: int, stop_event: asyncio.Event) -> None:
             await runtime.log("INFO", f"Bybit connected | env={conn['env']} | clock_drift={conn['clock_drift_seconds']}s")
 
             snapshots = await build_snapshots_for_guard(client, guard)
-            raw_decision = await engine.decide(
-                prompt=prompt,
-                snapshot={"symbols": snapshots},
-                risk_config=guard.public_config(),
-                skill_context=build_skill_context(mode="strategy_loop", command_or_prompt=prompt),
-                prompt_directives=prompt_meta,
-            )
-            if is_wait_action(raw_decision):
-                fallback = _action_from_prompt_directives(prompt, prompt_meta)
-                if fallback:
+            fallback = _action_from_prompt_directives(prompt, prompt_meta)
+            use_cost_saver = bool(settings.get("ai_cost_saver", True))
+            has_indicator_condition = bool(prompt_meta.get("rsi_rules") or prompt_meta.get("indicators"))
+            if use_cost_saver and fallback and not has_indicator_condition:
+                raw_decision = fallback
+                await runtime.log("INFO", "Tiết kiệm token: prompt DCA/lệnh rõ ràng được parser xử lý, không gọi AI vòng này.")
+            else:
+                raw_decision = await engine.decide(
+                    prompt=prompt,
+                    snapshot={"symbols": _compact_snapshot_for_ai(snapshots)},
+                    risk_config=guard.public_config(),
+                    skill_context=build_skill_context(mode="strategy_loop", command_or_prompt=prompt),
+                    prompt_directives=prompt_meta,
+                )
+                if is_wait_action(raw_decision) and fallback:
                     raw_decision = fallback
                     await runtime.log("INFO", "AI trả WAIT nhưng prompt có lịch DCA rõ ràng; bot dùng parser để tạo tín hiệu và vẫn giữ cooldown theo lịch.")
-            await runtime.log("INFO", "AI đã phân tích chiến lược và tạo tín hiệu.")
+                await runtime.log("INFO", "AI đã phân tích chiến lược và tạo tín hiệu.")
 
             try:
                 result = await analyze_and_execute(user_id=user_id, runtime=runtime, settings=settings, raw_decision=raw_decision, snapshots=snapshots)
@@ -824,19 +866,24 @@ async def run_saved_prompt_once(user_id: int) -> Dict[str, Any]:
     conn = await client.test_connection()
     await runtime.log("INFO", f"Bybit connected | env={conn['env']} | clock_drift={conn['clock_drift_seconds']}s")
     snapshots = await build_snapshots_for_guard(client, guard)
-    raw_decision = await engine.decide(
-        prompt=prompt,
-        snapshot={"symbols": snapshots},
-        risk_config=guard.public_config(),
-        skill_context=build_skill_context(mode="strategy_loop", command_or_prompt=prompt),
-        prompt_directives=prompt_meta,
-    )
-    if is_wait_action(raw_decision):
-        fallback = _action_from_prompt_directives(prompt, prompt_meta)
-        if fallback:
+    fallback = _action_from_prompt_directives(prompt, prompt_meta)
+    use_cost_saver = bool(settings.get("ai_cost_saver", True))
+    has_indicator_condition = bool(prompt_meta.get("rsi_rules") or prompt_meta.get("indicators"))
+    if use_cost_saver and fallback and not has_indicator_condition:
+        raw_decision = fallback
+        await runtime.log("INFO", "Tiết kiệm token: prompt rõ ràng được parser xử lý, không gọi AI lần này.")
+    else:
+        raw_decision = await engine.decide(
+            prompt=prompt,
+            snapshot={"symbols": _compact_snapshot_for_ai(snapshots)},
+            risk_config=guard.public_config(),
+            skill_context=build_skill_context(mode="strategy_loop", command_or_prompt=prompt),
+            prompt_directives=prompt_meta,
+        )
+        if is_wait_action(raw_decision) and fallback:
             raw_decision = fallback
             await runtime.log("INFO", "AI trả WAIT nhưng prompt có lịch DCA rõ ràng; bot dùng parser để tạo tín hiệu và vẫn giữ cooldown theo lịch.")
-    await runtime.log("INFO", "AI đã phân tích prompt đã lưu và tạo tín hiệu.")
+        await runtime.log("INFO", "AI đã phân tích prompt đã lưu và tạo tín hiệu.")
     result = await analyze_and_execute(user_id=user_id, runtime=runtime, settings=settings, raw_decision=raw_decision, snapshots=snapshots)
     if str((result.get("normalized") or {}).get("action") or "").upper() != "WAIT":
         _mark_scheduled_prompt_executed(user_id, prompt, prompt_meta)
@@ -1132,27 +1179,29 @@ async def direct_command(payload: CommandIn, user: Dict[str, Any] = Depends(curr
     await runtime.log("INFO", f"Nhận lệnh giao dịch trực tiếp: {redact_command_for_log(command)}")
     try:
         snapshots = await build_snapshots_for_guard(client, guard)
-        if engine.enabled:
+        parsed_first = parse_direct_command(command, allowed_symbols_from_guard(guard), guard.config.default_category)
+        use_cost_saver = bool(settings.get("ai_cost_saver", True))
+        if use_cost_saver and not is_wait_action(parsed_first):
+            raw_decision = parsed_first
+            await runtime.log("INFO", "Tiết kiệm token: lệnh trực tiếp rõ ràng được parser xử lý, không gọi AI.")
+        elif engine.enabled:
             raw_decision = await engine.command_to_action(
                 command=command,
-                snapshot={"symbols": snapshots},
+                snapshot={"symbols": _compact_snapshot_for_ai(snapshots)},
                 risk_config=guard.public_config(),
                 skill_context=build_skill_context(mode="manual_direct_command", command_or_prompt=command),
             )
             await runtime.log("INFO", "AI đã hiểu lệnh trực tiếp và chuyển thành tín hiệu giao dịch.")
-            # Direct Command là lệnh thực thi, không dùng trạng thái "đứng ngoài" như strategy loop.
-            # Nếu AI trả WAIT, thử parser nội bộ. Nếu vẫn WAIT thì báo thiếu thông tin thay vì ghi lệnh đứng ngoài.
             if is_wait_action(raw_decision):
-                fallback = parse_direct_command(command, allowed_symbols_from_guard(guard), guard.config.default_category)
-                if not is_wait_action(fallback):
-                    raw_decision = fallback
+                if not is_wait_action(parsed_first):
+                    raw_decision = parsed_first
                     await runtime.log("WARN", "AI trả về đứng ngoài cho lệnh trực tiếp. Đã dùng bộ đọc lệnh nội bộ để tiếp tục thực thi.")
                 else:
-                    msg = direct_wait_error(fallback if fallback else raw_decision)
+                    msg = direct_wait_error(parsed_first if parsed_first else raw_decision)
                     await runtime.log("WARN", msg)
                     raise RiskError(msg)
         else:
-            raw_decision = parse_direct_command(command, allowed_symbols_from_guard(guard), guard.config.default_category)
+            raw_decision = parsed_first
             await runtime.log("WARN", "Chưa nhập OpenAI key. Đã dùng bộ đọc lệnh đơn giản để xử lý lệnh trực tiếp.")
             if is_wait_action(raw_decision):
                 msg = direct_wait_error(raw_decision)

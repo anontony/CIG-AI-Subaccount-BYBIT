@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Iterable, List
 
@@ -32,8 +33,13 @@ def _pick_modules(text: str, mode: str) -> List[str]:
     return out
 
 
-def build_skill_context(*, mode: str, command_or_prompt: str = "", max_chars: int = 9000) -> str:
+def build_skill_context(*, mode: str, command_or_prompt: str = "", max_chars: int | None = None) -> str:
     """Return a compact local/auto-updated Bybit Skill context for the AI system prompt."""
+    if max_chars is None:
+        try:
+            max_chars = int(os.getenv("BYBIT_SKILL_CONTEXT_MAX_CHARS", "1800"))
+        except Exception:
+            max_chars = 1800
     skill_dir = ensure_seeded()
     status = read_status()
     chunks = [
@@ -41,12 +47,12 @@ def build_skill_context(*, mode: str, command_or_prompt: str = "", max_chars: in
         "Follow Safety > User Responsiveness > Convenience. Use Read+Trade API only; never Withdraw.",
         "Always keep CIG AI Subaccount Risk Guard as the final authority before execution.",
     ]
-    main = _read(skill_dir / "SKILL.md", 3000)
+    main = _read(skill_dir / "SKILL.md", 700)
     if main:
         chunks.append("\n[SKILL.md excerpt]\n" + main)
     for module in _pick_modules(command_or_prompt, mode):
         path = skill_dir / "modules" / f"{module}.md"
-        text = _read(path, 1700)
+        text = _read(path, 450)
         if text:
             chunks.append(f"\n[module:{module}.md excerpt]\n{text}")
     text = "\n\n".join(chunks)

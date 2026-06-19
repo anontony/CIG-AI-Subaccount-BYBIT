@@ -415,6 +415,7 @@ Ví dụ: đổi prompt thành: Chỉ trade BTCUSDT khi xu hướng rõ."></text
             <div class="field"><label>Cửa sổ nhận lệnh</label><input id="recv_window" value="5000" /></div>
             <div class="field"><label>OpenAI API Key</label><input id="openai_api_key" type="password" placeholder="Để trống nếu muốn giữ key cũ" /></div>
             <div class="field"><label>Model OpenAI</label><select id="openai_model">
+                <option value="gpt-4o-mini">GPT-4o mini - tiết kiệm mặc định</option>
                 <option value="gpt-5.5">GPT-5.5 - mạnh nhất</option>
                 <option value="gpt-5.5-pro">GPT-5.5 Pro - chính xác hơn</option>
                 <option value="gpt-5.4">GPT-5.4 - cân bằng</option>
@@ -424,7 +425,6 @@ Ví dụ: đổi prompt thành: Chỉ trade BTCUSDT khi xu hướng rõ."></text
                 <option value="gpt-4.1">GPT-4.1 - ổn định</option>
                 <option value="gpt-4.1-mini">GPT-4.1 mini - nhẹ</option>
                 <option value="gpt-4o">GPT-4o</option>
-                <option value="gpt-4o-mini">GPT-4o mini</option>
               </select></div>
             <div class="field wide"><label>Coin được phép giao dịch</label><input id="allowed_symbols" placeholder="BTCUSDT,ETHUSDT" /></div>
             <div class="field"><label>Chế độ thị trường mặc định</label><select id="default_category"><option value="auto">Tự động - AI chọn Spot/Futures theo lệnh</option><option value="linear">Futures Linear - USDT Perpetual</option><option value="spot">Spot - giao ngay</option><option value="inverse">Inverse</option></select></div>
@@ -438,6 +438,7 @@ Ví dụ: đổi prompt thành: Chỉ trade BTCUSDT khi xu hướng rõ."></text
             <div class="field"><label>SL mặc định (%)</label><input id="default_stop_loss_pct" value="0.6" placeholder="Ví dụ: 0.6" /></div>
             <div class="toggle-row"><div><b>Bắt buộc TP/SL</b><div class="mini">Nếu lệnh không ghi TP/SL, bot dùng TP/SL mặc định ở trên.</div></div><input id="require_tp_sl" type="checkbox" checked /></div>
             <div class="toggle-row"><div><b>Bật mô phỏng / DRY_RUN</b><div class="mini">Bật = giả lập. Tắt = gửi lệnh thật nếu API có quyền Trade.</div></div><input id="dry_run" type="checkbox" checked /></div>
+            <div class="toggle-row"><div><b>Tiết kiệm token AI</b><div class="mini">Bật = lệnh rõ ràng và DCA đơn giản sẽ dùng parser/rule trước, chỉ gọi AI khi thật sự cần phân tích.</div></div><input id="ai_cost_saver" type="checkbox" checked /></div>
           </div>
           <div class="panel" style="margin-top:14px; background:rgba(255,255,255,.032); box-shadow:none;">
             <div class="panel-head">
@@ -870,6 +871,7 @@ async function loadSettings() {
   ['bybit_auth_type','bybit_env','recv_window','openai_model','allowed_symbols','default_category','loop_interval_seconds','max_leverage','max_margin_per_trade_usdt','max_notional_usdt','max_daily_trades','min_seconds_between_trades','default_take_profit_pct','default_stop_loss_pct'].forEach(k => setVal(k, s[k]));
   setVal('require_tp_sl', s.require_tp_sl);
   setVal('dry_run', s.dry_run);
+  setVal('ai_cost_saver', s.ai_cost_saver ?? true);
   setVal('bybit_api_key', '');
   setVal('bybit_api_secret', '');
   setVal('openai_api_key', '');
@@ -879,7 +881,7 @@ async function loadSettings() {
   document.getElementById('openai_api_key').placeholder = 'Hiện tại: ' + (s.openai_api_key_masked || 'chưa có');
 }
 async function saveSettings() {
-  const keys = ['bybit_api_key','bybit_api_secret','bybit_auth_type','bybit_env','recv_window','openai_api_key','openai_model','allowed_symbols','default_category','max_leverage','max_margin_per_trade_usdt','max_notional_usdt','max_daily_trades','require_tp_sl','dry_run','default_take_profit_pct','default_stop_loss_pct','min_seconds_between_trades','loop_interval_seconds'];
+  const keys = ['bybit_api_key','bybit_api_secret','bybit_auth_type','bybit_env','recv_window','openai_api_key','openai_model','allowed_symbols','default_category','max_leverage','max_margin_per_trade_usdt','max_notional_usdt','max_daily_trades','require_tp_sl','dry_run','ai_cost_saver','default_take_profit_pct','default_stop_loss_pct','min_seconds_between_trades','loop_interval_seconds'];
   const body = {};
   keys.forEach(k => body[k] = getVal(k));
   try {
