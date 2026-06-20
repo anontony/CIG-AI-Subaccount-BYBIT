@@ -146,13 +146,23 @@ class BybitClient:
         elif method != "GET" and body is not None:
             content = self._compact_json(body)
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.request(method, url, headers=headers, content=content)
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.request(method, url, headers=headers, content=content)
+        except httpx.ConnectTimeout as exc:
+            raise BybitAPIError(f"Bybit connection timeout: không kết nối được {self.base_url} trong thời gian cho phép.") from exc
+        except httpx.ReadTimeout as exc:
+            raise BybitAPIError("Bybit read timeout: Bybit không phản hồi kịp thời.") from exc
+        except httpx.RequestError as exc:
+            raise BybitAPIError(f"Bybit network error: {exc}") from exc
 
         if response.status_code >= 400:
             raise BybitAPIError(f"HTTP {response.status_code}: {response.text[:500]}")
 
-        data = response.json()
+        try:
+            data = response.json()
+        except Exception as exc:
+            raise BybitAPIError(f"Bybit trả response không phải JSON hợp lệ: {response.text[:300]}") from exc
         ret_code = data.get("retCode")
         if ret_code in (10006,) and retry:
             await asyncio_sleep(1.0)

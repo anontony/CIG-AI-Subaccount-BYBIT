@@ -1,38 +1,50 @@
-# CIG AI Subaccount Clean V30
+# CIG AI Subaccount Clean V44
 
-Bản sạch của CIG AI Subaccount với vá lỗi TP/SL tracker.
+Bản V44 dọn lại live log để dashboard dễ đọc hơn sau khi tầng AI đã chạy ổn. Mặc định bot không còn in raw JSON snapshot/RAW AI response/PARSED SIGNAL ra Live Log. Các dòng đó chỉ hiện khi bật `AI_DEBUG_LOGS=true`.
 
-## Điểm sửa chính V30
+## Điểm mới V44
 
-- TP/SL tracker không chỉ báo chạm nữa mà có thêm lớp `enforce_tracked_tp_sl`.
-- Khi bot đang chạy, mỗi vòng sẽ kiểm tra các lệnh đang theo dõi.
-- Nếu lệnh Futures chạm TP hoặc SL:
-  - `dry_run=True`: chỉ đóng trạng thái theo dõi.
-  - `dry_run=False`: gửi lệnh đóng vị thế live qua Bybit `close_position`, sau đó đóng toàn bộ tracking cùng symbol/side.
-- Nếu Bybit báo không còn position, bot hiểu có thể Bybit TP/SL đã tự đóng và sẽ đóng tracking tương ứng.
-- Spot TP/SL vẫn chỉ theo dõi hiển thị, chưa tự OCO/auto sell.
+- Live Log mặc định chỉ hiển thị các dòng ngắn:
+  - Bot bắt đầu chạy
+  - Bybit OK
+  - Tóm tắt thị trường theo D1 / H4 / H1 / 15m
+  - Quyết định AI: WAIT / OPEN_LONG / OPEN_SHORT
+  - Kết quả lệnh hoặc lý do bị Risk Guard chặn
+- Raw debug JSON được chuyển sang chế độ debug ẩn mặc định.
+- Thêm biến môi trường `AI_DEBUG_LOGS=false`. Khi cần điều tra lỗi, đổi thành `true` để hiện lại:
+  - `AI DEBUG · MARKET SNAPSHOT SENT TO AI`
+  - `AI DEBUG · RAW AI RESPONSE`
+  - `AI DEBUG · PARSED SIGNAL`
+- Xoá `__pycache__` khỏi gói clean.
 
-## Lưu ý quan trọng
+## Cấu hình khuyến nghị
 
-Nếu anh đang test, nên bật Dry Run. Nếu `dry_run=False`, khi tracker phát hiện SL/TP chạm, bot có thể gửi lệnh đóng vị thế thật.
-
-## Railway
-
-Dùng Railway Volume `/data` nếu muốn lưu user/config/API. Muốn sạch hoàn toàn thì tạo Volume mới.
-
-## Local
-
-```bash
-python -m venv .venv
-.venv\\Scripts\\activate
-pip install -r requirements.txt
-python server.py
+```env
+OPENAI_MODEL=gpt-4o-mini
+OPENAI_FALLBACK_MODELS=gpt-4o-mini,gpt-4.1-mini
+AI_DEBUG_LOGS=false
 ```
 
-Mở: `http://localhost:8000`
+---
 
-## Ghi chú V30.1
+# CIG AI Subaccount Clean V43
 
-- Bot loop giờ kiểm tra TP/SL tracker trong lúc chờ vòng chiến lược tiếp theo.
-- Mặc định kiểm tra khoảng mỗi 10 giây khi bot đang Start.
-- Điều này tránh lỗi chiến lược chạy mỗi 30 phút nhưng SL/TP đã chạm mà bot chưa đóng.
+Bản V43 sửa tầng AI: ưu tiên strict function calling `submit_trading_signal`, fallback model chain (`OPENAI_FALLBACK_MODELS`), và deterministic recovery rõ lý do khi model trả `{}`.
+
+# CIG AI Subaccount Clean V41
+
+Bản V41 vá lỗi AI vẫn trả `{}` sau khi đổi prompt nới lỏng.
+
+## Sửa chính
+
+- Structured Output chuyển sang schema strict hơn, bắt buộc có `action` và `reason`.
+- Nếu AI vẫn trả `{}`, bot retry bằng payload rút gọn chỉ tập trung `linear:BTCUSDT`, không gửi lại toàn bộ prompt dài.
+- Retry bắt buộc trả một trong: `WAIT`, `OPEN_LONG`, `OPEN_SHORT`.
+- Nếu mở lệnh, bắt buộc có `stop_loss`, `take_profit`, `margin_usdt=8`, `risk_usdt=1`, `leverage=10`.
+- Nếu không đủ điều kiện, trả `WAIT` với ít nhất 2 lý do cụ thể từ snapshot.
+- Vẫn không dùng TP/SL mặc định khi prompt yêu cầu TP/SL theo ATR/RR/structure.
+
+## Test cần thấy
+
+`AI DEBUG · RAW AI RESPONSE` không nên còn là `{}`.  
+Nếu setup chưa đủ, raw response nên là JSON `WAIT` có reason chi tiết.

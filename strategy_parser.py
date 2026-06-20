@@ -97,22 +97,32 @@ def _parse_interval_seconds(ascii_text: str) -> tuple[Optional[int], str]:
 
 
 def _parse_timeframe(ascii_text: str) -> str:
+    found: list[str] = []
+
+    def add(raw: str) -> None:
+        raw = raw.upper()
+        aliases = {'D1': '1D', '1D': '1D', 'H4': '4H', '4H': '4H', 'H1': '1H', '1H': '1H', 'M30': '30M', '30M': '30M', 'M15': '15M', '15M': '15M'}
+        tf = aliases.get(raw, raw)
+        if tf not in found:
+            found.append(tf)
+
+    for raw in re.findall(r'\b(?:d1|1d|h4|4h|h1|1h|m30|30m|m15|15m)\b', ascii_text, flags=re.IGNORECASE):
+        add(raw)
+
     patterns = [
         r'(?:khung|timeframe|frame|tf)\s*(\d+)\s*([mhd])\b',
         r'(?:khung|timeframe|frame|tf)\s*([mhd])(\d+)\b',
-        r'\b([mhd])(\d+)\b',
     ]
     for pattern in patterns:
-        m = re.search(pattern, ascii_text, flags=re.IGNORECASE)
-        if not m:
-            continue
-        if len(m.groups()) == 2:
+        for m in re.finditer(pattern, ascii_text, flags=re.IGNORECASE):
             a, b = m.group(1), m.group(2)
-            if a.isdigit():
-                return f'{a}{b.lower()}'
-            return f'{b}{a.lower()}'
-    return ''
+            add(f'{a}{b}' if a.isdigit() else f'{b}{a}')
 
+    if found:
+        order = ['1D', '4H', '1H', '30M', '15M']
+        found = sorted(found, key=lambda x: order.index(x) if x in order else 99)
+        return '/'.join(found[:4])
+    return ''
 
 def _parse_pct(label_patterns: List[str], ascii_text: str) -> Optional[str]:
     for pattern in label_patterns:
@@ -137,6 +147,8 @@ def parse_strategy_prompt(prompt: str, allowed_symbols: Optional[List[str]] = No
         'futures_margin_usdt': None,
         'take_profit_pct': None,
         'stop_loss_pct': None,
+        'tp_sl_mode': '',
+        'requires_explicit_tp_sl': False,
         'rsi_rules': [],
         'indicators': [],
     }
@@ -164,26 +176,131 @@ def parse_strategy_prompt(prompt: str, allowed_symbols: Optional[List[str]] = No
                 out['leverage'] = int(num)
                 break
 
-    amounts = re.findall(r'(\d+(?:\.\d+)?)\s*(?:u|usdt|usd|do|đo|đô|dollar|dola)\b', original, flags=re.IGNORECASE)
-    if amounts:
-        amount = _clean_num(amounts[0])
-        if out['market'] == 'spot':
-            out['spot_order_usdt'] = amount
-        elif out['market'] == 'linear':
-            out['futures_margin_usdt'] = amount
-        else:
-            out['spot_order_usdt'] = amount
+    def _extract_money_with_context(text_original: str) -> list[tuple[str, str]]:
+        results: list[tuple[str, str]] = []
+        for m in re.finditer(r'(\d+(?:[\.,]\d+)?)\s*(?:u|usdt|usd|do|đo|đô|dollar|dola)\b', text_original, flags=re.IGNORECASE):
+            s, e = m.span()
+            # Use a local window rather than the whole paragraph/line. Strategy prompts
+            # are often pasted as one long paragraph, and using the full line can make
+            # a clear "margin futures mỗi lệnh: 8 USDT" get rejected because a later
+            # sentence contains "risk mỗi lệnh: 1 USDT".
+            ctx_start = max(0, s - 90)
+            ctx_end = min(len(text_original), e + 90)
+            ctx = _strip_accents(text_original[ctx_start:ctx_end].lower())
+            results.append((_clean_num(m.group(1)), ctx))
+        return results
 
+    money_items = _extract_money_with_context(original)
+
+    def _find_explicit_futures_margin(text: str) -> Optional[str]:
+        """Find only amounts directly labeled as futures/order margin.
+
+        This is deliberately stricter than generic money parsing so numbers such as
+        risk_usdt=1, account equity=50, daily target, or max loss are never turned
+        into order margin just because a nearby sentence mentions margin_usdt.
+        """
+        t = _strip_accents(text.lower())
+        amount = r'(\d+(?:[\.,]\d+)?)'
+        money = r'(?:u|usdt|usd|do|dong|dollar|dola)'
+        labels_before = [
+            r'margin_usdt',
+            r'margin\s*futures\s*(?:moi\s*lenh|cho\s*moi\s*lenh|lenh)?',
+            r'margin\s*(?:moi\s*lenh|cho\s*moi\s*lenh|lenh)',
+            r'ky\s*quy\s*(?:moi\s*lenh|cho\s*moi\s*lenh|lenh)?',
+            r'order\s*margin',
+        ]
+        labels_after = [
+            r'margin_usdt',
+            r'margin\s*futures',
+            r'margin\s*(?:moi\s*lenh|cho\s*moi\s*lenh|lenh)',
+            r'ky\s*quy\s*(?:moi\s*lenh|cho\s*moi\s*lenh|lenh)?',
+        ]
+        for label in labels_before:
+            pattern = rf'\b(?:{label})\b\s*(?:=|:|la|là|mac\s*dinh|default|dung|su\s*dung|use)?\s*{amount}\s*{money}\b'
+            m = re.search(pattern, t, flags=re.IGNORECASE)
+            if m:
+                return _clean_num(m.group(1))
+        for label in labels_after:
+            pattern = rf'\b{amount}\s*{money}\s*(?:cho|lam|la|as)?\s*(?:{label})\b'
+            m = re.search(pattern, t, flags=re.IGNORECASE)
+            if m:
+                return _clean_num(m.group(1))
+        return None
+
+    explicit_futures_margin = _find_explicit_futures_margin(original)
+
+    # These words mean the number is NOT order margin.
+    # This prevents bugs like: "Account equity reference: 50" -> Margin Futures 50,
+    # or "risk_usdt: 1" -> Margin Futures 1.
+    not_margin_context = [
+        'account equity', 'equity reference', 'von mau', 'von ban dau', 'von tham chieu',
+        'so du', 'tai khoan', 'muc tieu', 'lo toi da', 'muc tieu loi', 'ngay',
+        'risk moi lenh', 'risk toi da', 'risk_usdt', 'rui ro', 'chap nhan lo',
+        'take-profit', 'take profit', 'stop-loss', 'stop loss', 'tp ', 'sl ',
+        'position_notional', 'notional uoc tinh', 'notional', 'max_notional',
+    ]
+    margin_context = [
+        'margin futures moi lenh', 'margin moi lenh', 'margin futures', 'margin_usdt',
+        'ky quy moi lenh', 'ky quy', 'margin can dung', 'dung margin',
+        'von vao lenh', 'von moi lenh', 'order margin', 'margin required',
+    ]
+    spot_context = [
+        'spot size', 'spot_order_usdt', 'mua spot', 'spot mua', 'mua bitcoin spot',
+        'mua btc spot', 'giao ngay', 'spot moi lenh',
+    ]
+
+    def _pick_money(require: list[str], avoid: list[str] | None = None) -> Optional[str]:
+        avoid = avoid or []
+        for amount, ctx in money_items:
+            if any(term in ctx for term in require) and not any(term in ctx for term in avoid):
+                return amount
+        return None
+
+    if out['market'] == 'spot':
+        out['spot_order_usdt'] = _pick_money(spot_context)
+        if not out['spot_order_usdt'] and len(original) < 350 and money_items:
+            out['spot_order_usdt'] = money_items[0][0]
+    elif out['market'] == 'linear':
+        out['futures_margin_usdt'] = explicit_futures_margin or _pick_money(margin_context, not_margin_context)
+        if not out['futures_margin_usdt'] and len(original) < 350 and money_items:
+            for amount, ctx in money_items:
+                if not any(term in ctx for term in not_margin_context):
+                    out['futures_margin_usdt'] = amount
+                    break
+    else:
+        out['spot_order_usdt'] = _pick_money(spot_context)
+        out['futures_margin_usdt'] = explicit_futures_margin or _pick_money(margin_context, not_margin_context)
+
+    # Only treat TP/SL as percentage when the prompt explicitly uses % / percent.
+    # This prevents strategy text like "take-profit 1.5R" or "1.2 ATR"
+    # from being misread as TP 1.5% / TP 1.2%.
     out['take_profit_pct'] = _parse_pct([
-        r'\btp\s*[:=]?\s*(\d+(?:[\.,]\d+)?)\s*%?',
-        r'take\s*profit\s*[:=]?\s*(\d+(?:[\.,]\d+)?)\s*%?',
-        r'chot\s*loi\s*[:=]?\s*(\d+(?:[\.,]\d+)?)\s*%?',
+        r'\btp\s*[:=]?\s*(\d+(?:[\.,]\d+)?)\s*(?:%|phan\s*tram|percent)\b',
+        r'take\s*profit\s*[:=]?\s*(\d+(?:[\.,]\d+)?)\s*(?:%|phan\s*tram|percent)\b',
+        r'chot\s*loi\s*[:=]?\s*(\d+(?:[\.,]\d+)?)\s*(?:%|phan\s*tram|percent)\b',
     ], ascii_text)
     out['stop_loss_pct'] = _parse_pct([
-        r'\bsl\s*[:=]?\s*(\d+(?:[\.,]\d+)?)\s*%?',
-        r'stop\s*loss\s*[:=]?\s*(\d+(?:[\.,]\d+)?)\s*%?',
-        r'cat\s*lo\s*[:=]?\s*(\d+(?:[\.,]\d+)?)\s*%?',
+        r'\bsl\s*[:=]?\s*(\d+(?:[\.,]\d+)?)\s*(?:%|phan\s*tram|percent)\b',
+        r'stop\s*loss\s*[:=]?\s*(\d+(?:[\.,]\d+)?)\s*(?:%|phan\s*tram|percent)\b',
+        r'cat\s*lo\s*[:=]?\s*(\d+(?:[\.,]\d+)?)\s*(?:%|phan\s*tram|percent)\b',
     ], ascii_text)
+
+    # Strategy TP/SL mode. If the user describes ATR/R-multiple/structure exits,
+    # the execution layer must require explicit AI-computed TP/SL prices and must
+    # not silently fall back to dashboard default TP/SL percentages.
+    rr_or_atr_terms = [
+        '1.5r', '2r', ' rr', 'r:r', 'risk/reward', 'risk reward',
+        'atr', 'atr14', 'cau truc', 'structure', 'day gan nhat', 'dinh gan nhat',
+        'vung ho tro', 'vung khang cu', 'stop-loss phai co', 'stop loss phai co',
+        'take-profit toi thieu', 'take profit toi thieu', 'tp toi thieu',
+        'khong duoc vao lenh neu thieu stop_loss', 'khong duoc vao lenh neu thieu stop loss',
+        'khong duoc vao lenh neu thieu take_profit', 'khong duoc vao lenh neu thieu take profit',
+        'khong dung tp phan tram co dinh', 'khong dung tp/sl mac dinh',
+        'khong duoc dung tpsl mac dinh', 'khong duoc dung tp/sl mac dinh',
+    ]
+    if any(term in ascii_text for term in rr_or_atr_terms):
+        out['tp_sl_mode'] = 'explicit_price_required'
+        out['requires_explicit_tp_sl'] = True
 
     indicators = []
     for key in ['rsi', 'ema', 'macd', 'atr', 'volume', 'vol', 'bollinger', 'bb', 'sma']:
@@ -231,6 +348,8 @@ def summarize_strategy_directives(meta: Dict[str, Any]) -> str:
         parts.append(f"TP: {meta['take_profit_pct']}%")
     if meta.get('stop_loss_pct'):
         parts.append(f"SL: {meta['stop_loss_pct']}%")
+    if meta.get('requires_explicit_tp_sl'):
+        parts.append('TP/SL: yêu cầu giá cụ thể, không dùng mặc định')
     if meta.get('rsi_rules'):
         parts.append('RSI: ' + '; '.join(meta['rsi_rules'][:2]))
     if meta.get('indicators'):

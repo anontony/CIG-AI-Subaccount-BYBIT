@@ -1,6 +1,7 @@
 import asyncio
 import json
 import hashlib
+import os
 import time
 import re
 from decimal import Decimal
@@ -29,7 +30,7 @@ from strategy_parser import parse_strategy_prompt, summarize_strategy_directives
 
 load_dotenv()
 
-app = FastAPI(title="CIG AI Subaccount", version="30.0.0")
+app = FastAPI(title="CIG AI Subaccount", version="44.0.0")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 store = UserStore()
 runtimes = RuntimeManager(log_store=store)
@@ -213,7 +214,10 @@ def summarize_trade_result(result: Dict[str, Any]) -> str:
     execution = result.get("execution") or {}
     action = str(n.get("action") or "").upper()
     if action == "WAIT":
-        return "AI quyết định ĐỨNG NGOÀI · " + str(n.get("reason") or execution.get("reason") or "Chưa có tín hiệu rõ")[:220]
+        wait_reason = str(n.get("reason") or execution.get("reason") or "").strip()
+        if wait_reason.lower() in {"", "no reason provided", "none", "null", "n/a", "na"}:
+            wait_reason = "KHÔNG VÀO LỆNH: chưa có tín hiệu đủ rõ hoặc chưa đủ dữ liệu để tính TP/SL cụ thể."
+        return "AI quyết định ĐỨNG NGOÀI · " + wait_reason[:220]
     symbol = n.get("symbol") or "-"
     category = str(n.get("category") or "-").upper()
     status = str(execution.get("status") or "-")
@@ -458,13 +462,60 @@ def _mark_scheduled_prompt_executed(user_id: int, prompt: str, meta: Dict[str, A
     })
 
 
-def _action_from_prompt_directives(prompt: str, meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Deterministic fallback for simple recurring/DCA prompts.
 
-    The AI still receives the prompt and market snapshot first. This fallback is
-    only used when AI is overly conservative and returns WAIT for a clear
-    execution-style prompt such as `mua bitcoin spot 10 usdt/1h`.
+def _apply_prompt_tp_sl_constraints(raw_decision: Dict[str, Any], prompt_meta: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach non-negotiable prompt constraints to the AI/fallback decision.
+
+    If a strategy prompt uses ATR/R-multiple/structure exits, TP/SL must be
+    explicit prices from AI. The risk guard will block the order instead of
+    applying dashboard default TP/SL percentages.
     """
+    decision = dict(raw_decision or {})
+    action = str(decision.get("action") or "WAIT").upper().strip()
+    if action in OPENING_ACTIONS and prompt_meta.get("requires_explicit_tp_sl"):
+        decision["require_explicit_tp_sl"] = True
+        decision["no_default_tp_sl"] = True
+        if not decision.get("reason"):
+            decision["reason"] = "Prompt yêu cầu TP/SL cụ thể theo ATR/RR/structure."
+    return decision
+
+def _is_simple_dca_or_direct_prompt(prompt: str, meta: Dict[str, Any]) -> bool:
+    """Return True only for deterministic execution prompts safe to run without AI.
+
+    Complex strategy prompts that mention indicators, ATR, R/R, structure,
+    or require explicit TP/SL must NOT be converted from WAIT into an order.
+    """
+    lower = (prompt or "").lower()
+    if meta.get("requires_explicit_tp_sl"):
+        return False
+    if meta.get("rsi_rules") or meta.get("indicators"):
+        # Indicator strategies must be evaluated by AI/strategy engine, not fallback.
+        return False
+    complex_terms = [
+        "atr", "1.5r", "2r", "r:r", "risk/reward", "risk reward",
+        "ema", "macd", "rsi", "volume", "bollinger", "structure",
+        "cấu trúc", "cau truc", "hỗ trợ", "ho tro", "kháng cự", "khang cu",
+        "pullback", "xu hướng", "xu huong", "trend", "setup",
+        "điều kiện", "dieu kien", "chỉ báo", "chi bao",
+    ]
+    if any(term in lower for term in complex_terms):
+        return False
+    # Only very short prompts should be deterministic fallback: e.g.
+    # "mua btc spot 10u/1h" or "long btc x10 vốn 8u".
+    if len(prompt or "") > 260:
+        return False
+    return True
+
+
+def _action_from_prompt_directives(prompt: str, meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Deterministic fallback for simple recurring/DCA/execution prompts only.
+
+    The fallback must never turn an AI WAIT into a trade for complex strategy
+    prompts such as ATR/RR/EMA/RSI systems. For those, WAIT means WAIT.
+    """
+    if not _is_simple_dca_or_direct_prompt(prompt, meta):
+        return None
+
     lower = (prompt or "").lower()
     is_buy = any(k in lower for k in ["mua", "buy", "gom", "dca", "tích lũy", "tich luy"])
     is_short = any(k in lower for k in ["short", "sell short"])
@@ -499,7 +550,7 @@ def _action_from_prompt_directives(prompt: str, meta: Dict[str, Any]) -> Optiona
             "category": "linear",
             "margin_usdt": str(meta.get("futures_margin_usdt")),
             "leverage": int(meta.get("leverage") or 1),
-            "reason": "Prompt recurring futures instruction parsed deterministically; cadence is enforced by scheduler.",
+            "reason": "Simple recurring futures instruction parsed deterministically; cadence is enforced by scheduler.",
         }
         if meta.get("take_profit_pct"):
             out["take_profit_pct"] = meta.get("take_profit_pct")
@@ -541,20 +592,97 @@ async def record_trade_tracking(user_id: int, runtime: UserRuntimeState, result:
 
 
 
+def _structure_from_klines(raw_klines: list[Any], *, lookback: int = 80) -> Dict[str, Any]:
+    """Return simple recent structure levels from Bybit kline rows.
+
+    Bybit returns newest-first rows. We only need conservative levels for the AI
+    snapshot: recent swing high/low plus rough support/resistance. These are not
+    execution guarantees; Risk Guard still validates orders.
+    """
+    rows = []
+    for item in raw_klines or []:
+        try:
+            rows.append({
+                "ts": int(item[0]),
+                "high": Decimal(str(item[2])),
+                "low": Decimal(str(item[3])),
+                "close": Decimal(str(item[4])),
+            })
+        except Exception:
+            continue
+    rows.sort(key=lambda x: x["ts"])
+    if not rows:
+        return {"status": "no_data"}
+    recent = rows[-lookback:] if len(rows) > lookback else rows
+    highs = [r["high"] for r in recent]
+    lows = [r["low"] for r in recent]
+    closes = [r["close"] for r in recent]
+    last_close = closes[-1]
+    support = min(lows)
+    resistance = max(highs)
+    return {
+        "status": "ok",
+        "lookback": len(recent),
+        "last_close": float(last_close),
+        "recent_support": float(support),
+        "recent_resistance": float(resistance),
+        "swing_low": float(support),
+        "swing_high": float(resistance),
+        "distance_to_support_pct": float(((last_close - support) / last_close * Decimal("100"))) if last_close else None,
+        "distance_to_resistance_pct": float(((resistance - last_close) / last_close * Decimal("100"))) if last_close else None,
+    }
+
+
+async def _timeframe_pack(client: BybitClient, symbol: str, category: str, interval: str, limit: int = 220) -> Dict[str, Any]:
+    kline = await client.get_klines(symbol, category, interval=interval, limit=limit)
+    raw_klines = kline.get("result", {}).get("list", [])
+    return {
+        "klines": compact_kline_summary(raw_klines),
+        "indicators": calculate_indicators(raw_klines),
+        "structure": _structure_from_klines(raw_klines),
+    }
+
+
 async def build_market_snapshot(client: BybitClient, symbol: str, category: str) -> Dict[str, Any]:
     ticker = await client.get_ticker(symbol, category)
-    kline = await client.get_klines(symbol, category, interval="15", limit=200)
-    raw_klines = kline.get("result", {}).get("list", [])
+
+    # Strategy prompts in this app commonly reference D1/H4/H1. Older builds only
+    # sent 15m data, causing the AI to WAIT or fail TP/SL calculation for ATR/RR
+    # strategies. V38 sends the required multi-timeframe snapshot.
+    timeframe_specs = {
+        "15m": "15",
+        "1h": "60",
+        "4h": "240",
+        "1d": "D",
+    }
+    timeframes: Dict[str, Any] = {}
+    for label, interval in timeframe_specs.items():
+        try:
+            timeframes[label] = await _timeframe_pack(client, symbol, category, interval)
+        except Exception as exc:
+            timeframes[label] = {"error": f"Không lấy được dữ liệu {label}: {exc}"}
+
     wallet = await client.get_wallet_balance()
     positions = {"result": {"list": []}}
     if category in {"linear", "inverse"}:
         positions = await client.get_positions(symbol, category)
+
+    # Keep legacy fields for older UI / Risk Guard code while adding new multi-TF fields.
+    indicators_15m = (timeframes.get("15m") or {}).get("indicators", {})
+    klines_15m = (timeframes.get("15m") or {}).get("klines", {})
     return {
         "symbol": symbol,
         "category": category,
         "ticker": ticker,
-        "klines_15m": compact_kline_summary(raw_klines),
-        "indicators_15m": calculate_indicators(raw_klines),
+        "timeframes": timeframes,
+        "klines_15m": klines_15m,
+        "indicators_15m": indicators_15m,
+        "indicators_1h": (timeframes.get("1h") or {}).get("indicators", {}),
+        "indicators_4h": (timeframes.get("4h") or {}).get("indicators", {}),
+        "indicators_1d": (timeframes.get("1d") or {}).get("indicators", {}),
+        "structure_1h": (timeframes.get("1h") or {}).get("structure", {}),
+        "structure_4h": (timeframes.get("4h") or {}).get("structure", {}),
+        "structure_1d": (timeframes.get("1d") or {}).get("structure", {}),
         "positions": positions.get("result", {}).get("list", []),
         "wallet": wallet.get("result", {}),
     }
@@ -578,17 +706,157 @@ async def build_snapshots_for_guard(client: BybitClient, guard: RiskGuard) -> Di
 
 
 
-def _compact_snapshot_for_ai(snapshots: Dict[str, Any]) -> Dict[str, Any]:
-    """Trim Bybit snapshots before sending them to the LLM."""
+def _short_json(obj: Any, limit: int = 1400) -> str:
+    """Compact JSON for live logs without crashing on Decimal/unknown objects."""
+    try:
+        text = json.dumps(obj, ensure_ascii=False, default=str, separators=(",", ":"))
+    except Exception:
+        text = str(obj)
+    if len(text) > limit:
+        return text[:limit] + "..."
+    return text
+
+
+def _debug_signal_view(decision: Dict[str, Any]) -> Dict[str, Any]:
+    """Small parsed-signal view for AI debug logs."""
+    if not isinstance(decision, dict):
+        return {"raw_type": type(decision).__name__}
+    keys = [
+        "action", "category", "symbol", "leverage", "margin_usdt", "risk_usdt",
+        "take_profit", "stop_loss", "take_profit_pct", "stop_loss_pct", "confidence", "reason",
+    ]
+    return {k: decision.get(k) for k in keys if k in decision}
+
+
+
+
+def _flag_enabled(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on", "debug"}
+
+
+def _ai_debug_enabled(settings: Dict[str, Any] | None = None) -> bool:
+    """Raw AI debug logs are useful during debugging but too noisy for daily use."""
+    if settings and "ai_debug_logs" in settings:
+        return _flag_enabled(settings.get("ai_debug_logs"), False)
+    return _flag_enabled(os.getenv("AI_DEBUG_LOGS"), False)
+
+
+def _fmt_num(value: Any, digits: int = 2) -> str:
+    if value in (None, ""):
+        return "-"
+    try:
+        q = Decimal("1") if digits <= 0 else Decimal("1").scaleb(-digits)
+        return str(Decimal(str(value)).quantize(q)).rstrip("0").rstrip(".")
+    except Exception:
+        return str(value)
+
+
+def _tf_brief(pack: Dict[str, Any] | None) -> str:
+    pack = pack or {}
+    ind = pack.get("indicators") or {}
+    struct = pack.get("structure") or {}
+    if ind.get("status") and ind.get("status") != "ok":
+        return f"lỗi {ind.get('status')}"
+    trend = ind.get("trend") or "-"
+    rsi = _fmt_num(ind.get("rsi14"), 1)
+    macd = ((ind.get("macd") or {}).get("bias") or "-") if isinstance(ind.get("macd"), dict) else "-"
+    ema50 = _fmt_num(ind.get("ema50"), 0)
+    ema200 = _fmt_num(ind.get("ema200"), 0)
+    sr = ""
+    if struct:
+        sr = f" · S/R {_fmt_num(struct.get('recent_support'),0)}/{_fmt_num(struct.get('recent_resistance'),0)}"
+    return f"{trend} · RSI {rsi} · MACD {macd} · EMA50/200 {ema50}/{ema200}{sr}"
+
+
+def _market_snapshot_brief(ai_snapshot: Dict[str, Any]) -> str:
+    symbols = ai_snapshot.get("symbols") if isinstance(ai_snapshot, dict) else None
+    if not isinstance(symbols, dict) or not symbols:
+        return "Dữ liệu thị trường: trống hoặc không hợp lệ."
+    preferred_key = None
+    for key in symbols:
+        if str(key).lower() == "linear:btcusdt":
+            preferred_key = key
+            break
+    preferred_key = preferred_key or next(iter(symbols.keys()))
+    snap = symbols.get(preferred_key) or {}
+    sym = snap.get("symbol") or preferred_key
+    cat = str(snap.get("category") or "-").upper()
+    price = _fmt_num(snap.get("price"), 2)
+    tfs = snap.get("timeframes") or {}
+    parts = [f"Market {cat} {sym} giá {price}"]
+    for label in ("1d", "4h", "1h", "15m"):
+        if label in tfs:
+            parts.append(f"{label.upper()}: {_tf_brief(tfs.get(label))}")
+    return " · ".join(parts)
+
+
+def _raw_ai_brief(decision: Dict[str, Any]) -> str:
+    if not isinstance(decision, dict):
+        return f"AI trả dữ liệu không hợp lệ: {type(decision).__name__}"
+    action = str(decision.get("action") or "WAIT").upper()
+    symbol = decision.get("symbol") or "BTCUSDT"
+    reason = str(decision.get("reason") or "").strip()
+    if action in {"WAIT", "HOLD", "NO_TRADE"}:
+        return f"AI: WAIT {symbol} · {reason[:260] if reason else 'chưa có setup đủ rõ.'}"
+    pieces = [f"AI: {action} {symbol}"]
+    if decision.get("leverage"):
+        pieces.append(f"lev {decision.get('leverage')}x")
+    if decision.get("margin_usdt"):
+        pieces.append(f"margin {decision.get('margin_usdt')} USDT")
+    if decision.get("risk_usdt"):
+        pieces.append(f"risk {decision.get('risk_usdt')} USDT")
+    if decision.get("stop_loss"):
+        pieces.append(f"SL {_short_number(decision.get('stop_loss'))}")
+    if decision.get("take_profit"):
+        pieces.append(f"TP {_short_number(decision.get('take_profit'))}")
+    if decision.get("confidence") is not None:
+        pieces.append(f"conf {decision.get('confidence')}")
+    if reason:
+        pieces.append("lý do: " + reason[:220])
+    return " · ".join(pieces)
+
+
+async def _log_ai_result(runtime: UserRuntimeState, settings: Dict[str, Any], ai_snapshot: Dict[str, Any], raw_decision: Dict[str, Any]) -> None:
+    """Clean live log by default; raw payloads only when AI_DEBUG_LOGS=true."""
+    await runtime.log("INFO", _market_snapshot_brief(ai_snapshot))
+    await runtime.log("INFO", _raw_ai_brief(raw_decision))
+    if _ai_debug_enabled(settings):
+        await runtime.log("DEBUG", "AI DEBUG · MARKET SNAPSHOT SENT TO AI: " + _short_json(ai_snapshot, 2200))
+        debug_payload = raw_decision.get("_debug") if isinstance(raw_decision, dict) else None
+        if isinstance(debug_payload, dict):
+            await runtime.log("DEBUG", "AI DEBUG · RAW AI RESPONSE: " + str(debug_payload.get("raw_ai_response") or "")[:2200])
+        else:
+            await runtime.log("DEBUG", "AI DEBUG · RAW AI RESPONSE: <không có raw response>")
+        await runtime.log("DEBUG", "AI DEBUG · PARSED SIGNAL: " + _short_json(_debug_signal_view(raw_decision), 1600))
+
+def _compact_snapshot_for_ai(snapshots: Dict[str, Any], prompt_meta: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """Trim Bybit snapshots before sending them to the LLM.
+
+    For strategy prompts, focus on the requested market/symbol to reduce token
+    pressure and prevent models from returning empty `{}` on oversized payloads.
+    """
     compact: Dict[str, Any] = {}
+    meta = prompt_meta or {}
+    wanted_symbols = set(meta.get("symbols") or [])
+    wanted_market = str(meta.get("market") or "").lower().strip()
     for key, snap in (snapshots or {}).items():
+        if wanted_symbols or wanted_market:
+            try:
+                cat, sym = key.split(":", 1)
+            except ValueError:
+                cat, sym = "", ""
+            if wanted_symbols and sym not in wanted_symbols:
+                continue
+            if wanted_market and wanted_market != cat:
+                continue
         if not isinstance(snap, dict):
             continue
         if snap.get("error"):
             compact[key] = {"error": snap.get("error")}
             continue
         ticker = snap.get("ticker") or {}
-        indicators = snap.get("indicators_15m") or {}
         positions = snap.get("positions") or []
         compact_positions = []
         for pos in positions[:2] if isinstance(positions, list) else []:
@@ -599,6 +867,16 @@ def _compact_snapshot_for_ai(snapshots: Dict[str, Any]) -> Dict[str, Any]:
                     "avgPrice": pos.get("avgPrice"),
                     "unrealisedPnl": pos.get("unrealisedPnl"),
                 })
+
+        def tf(label: str) -> Dict[str, Any]:
+            pack = ((snap.get("timeframes") or {}).get(label) or {}) if isinstance(snap.get("timeframes"), dict) else {}
+            if pack.get("error"):
+                return {"error": pack.get("error")}
+            return {
+                "indicators": pack.get("indicators") or {},
+                "structure": pack.get("structure") or {},
+            }
+
         compact[key] = {
             "symbol": snap.get("symbol"),
             "category": snap.get("category"),
@@ -607,7 +885,14 @@ def _compact_snapshot_for_ai(snapshots: Dict[str, Any]) -> Dict[str, Any]:
             "ask1Price": ticker.get("ask1Price"),
             "price24hPcnt": ticker.get("price24hPcnt"),
             "volume24h": ticker.get("volume24h"),
-            "indicators_15m": indicators,
+            "timeframes": {
+                "1d": tf("1d"),
+                "4h": tf("4h"),
+                "1h": tf("1h"),
+                "15m": tf("15m"),
+            },
+            # Legacy alias for existing prompts/debug comparisons.
+            "indicators_15m": snap.get("indicators_15m") or {},
             "positions": compact_positions,
         }
     return compact
@@ -853,7 +1138,7 @@ async def bot_loop_safe(user_id: int, stop_event: asyncio.Event) -> None:
     prompt_hash: Optional[int] = None
 
     try:
-        await runtime.log("INFO", "CIG AI Subaccount bắt đầu chạy trong workspace của user hiện tại.")
+        await runtime.log("INFO", "Bot bắt đầu chạy.")
 
         while not stop_event.is_set():
             runtime.reset_daily_counter_if_needed()
@@ -885,8 +1170,8 @@ async def bot_loop_safe(user_id: int, stop_event: asyncio.Event) -> None:
             new_hash = hash(prompt)
             if new_hash != prompt_hash:
                 prompt_hash = new_hash
-                await runtime.log("INFO", "Đã tải prompt mới. Prompt cũ đã bị ghi đè, không lưu lịch sử.")
-                await runtime.log("INFO", f"Bybit env={client.env} | sign={client.signing_label()} | dry_run={guard.config.dry_run} | key={client.masked_key()}")
+                await runtime.log("INFO", "Đã tải prompt mới.")
+                await runtime.log("INFO", f"Bybit: {client.env} · {client.signing_label()} · dry_run={guard.config.dry_run} · key={client.masked_key()}")
 
             prompt_meta = parse_strategy_prompt(prompt, allowed_symbols_from_guard(guard))
             wait_left = _scheduled_prompt_wait_seconds(settings, prompt, prompt_meta)
@@ -896,8 +1181,19 @@ async def bot_loop_safe(user_id: int, stop_event: asyncio.Event) -> None:
                 await wait_with_tp_sl_monitor(user_id, runtime, settings, stop_event, min(wait_left, interval))
                 continue
 
-            conn = await client.test_connection()
-            await runtime.log("INFO", f"Bybit connected | env={conn['env']} | clock_drift={conn['clock_drift_seconds']}s")
+            await runtime.log("INFO", "Đang kiểm tra Bybit...")
+            try:
+                conn = await asyncio.wait_for(client.test_connection(), timeout=25)
+            except asyncio.TimeoutError:
+                await runtime.log("ERROR", "Bybit connection timeout sau 25 giây. Bot dừng để tránh treo im lặng.")
+                return
+            except BybitAPIError as exc:
+                await runtime.log("ERROR", f"Bybit connection failed: {exc}")
+                return
+            except Exception as exc:
+                await runtime.log("ERROR", f"Bybit connection crashed: {type(exc).__name__}: {exc}")
+                return
+            await runtime.log("INFO", f"Bybit OK · env={conn['env']} · lệch giờ={conn['clock_drift_seconds']}s")
 
             await enforce_tracked_tp_sl(user_id, runtime, settings)
 
@@ -909,17 +1205,23 @@ async def bot_loop_safe(user_id: int, stop_event: asyncio.Event) -> None:
                 raw_decision = fallback
                 await runtime.log("INFO", "Tiết kiệm token: prompt DCA/lệnh rõ ràng được parser xử lý, không gọi AI vòng này.")
             else:
+                ai_snapshot = {"symbols": _compact_snapshot_for_ai(snapshots, prompt_meta)}
                 raw_decision = await engine.decide(
                     prompt=prompt,
-                    snapshot={"symbols": _compact_snapshot_for_ai(snapshots)},
+                    snapshot=ai_snapshot,
                     risk_config=guard.public_config(),
                     skill_context=build_skill_context(mode="strategy_loop", command_or_prompt=prompt),
                     prompt_directives=prompt_meta,
                 )
+                await _log_ai_result(runtime, settings, ai_snapshot, raw_decision)
                 if is_wait_action(raw_decision) and fallback:
                     raw_decision = fallback
-                    await runtime.log("INFO", "AI trả WAIT nhưng prompt có lịch DCA rõ ràng; bot dùng parser để tạo tín hiệu và vẫn giữ lịch riêng của prompt.")
-                await runtime.log("INFO", "AI đã phân tích chiến lược và tạo tín hiệu.")
+                    await runtime.log("INFO", "Parser an toàn: AI trả WAIT nhưng prompt là lệnh đơn giản/DCA rõ ràng, dùng tín hiệu parser.")
+                await runtime.log("INFO", "AI đã phân tích xong.")
+
+            raw_decision = _apply_prompt_tp_sl_constraints(raw_decision, prompt_meta)
+            if prompt_meta.get("requires_explicit_tp_sl") and str(raw_decision.get("action") or "").upper() in OPENING_ACTIONS:
+                await runtime.log("INFO", "Prompt yêu cầu TP/SL cụ thể theo ATR/RR/structure; bot sẽ không dùng TP/SL mặc định.")
 
             try:
                 result = await analyze_and_execute(user_id=user_id, runtime=runtime, settings=settings, raw_decision=raw_decision, snapshots=snapshots)
@@ -952,7 +1254,7 @@ async def run_saved_prompt_once(user_id: int) -> Dict[str, Any]:
     engine = make_engine(settings)
     guard = make_risk_guard(settings, runtime)
 
-    await runtime.log("INFO", "Đã bấm chạy prompt một lần: thực hiện đúng một vòng phân tích như loop tự động.")
+    await runtime.log("INFO", "Chạy thử prompt một lần.")
 
     if not prompt:
         msg = "Chưa có prompt. Hãy Save Prompt trước khi Run Once."
@@ -973,8 +1275,18 @@ async def run_saved_prompt_once(user_id: int) -> Dict[str, Any]:
         await runtime.log("INFO", msg)
         return {"ok": True, "skipped": True, "summary": msg, "prompt_meta": prompt_meta}
 
-    conn = await client.test_connection()
-    await runtime.log("INFO", f"Bybit connected | env={conn['env']} | clock_drift={conn['clock_drift_seconds']}s")
+    await runtime.log("INFO", "Đang kiểm tra Bybit trước khi chạy thử...")
+    try:
+        conn = await asyncio.wait_for(client.test_connection(), timeout=25)
+    except asyncio.TimeoutError:
+        msg = "Bybit connection timeout sau 25 giây."
+        await runtime.log("ERROR", msg)
+        raise HTTPException(status_code=400, detail=msg)
+    except BybitAPIError as exc:
+        msg = f"Bybit connection failed: {exc}"
+        await runtime.log("ERROR", msg)
+        raise HTTPException(status_code=400, detail=msg)
+    await runtime.log("INFO", f"Bybit OK · env={conn['env']} · lệch giờ={conn['clock_drift_seconds']}s")
     await enforce_tracked_tp_sl(user_id, runtime, settings)
     snapshots = await build_snapshots_for_guard(client, guard)
     fallback = _action_from_prompt_directives(prompt, prompt_meta)
@@ -984,17 +1296,22 @@ async def run_saved_prompt_once(user_id: int) -> Dict[str, Any]:
         raw_decision = fallback
         await runtime.log("INFO", "Tiết kiệm token: prompt rõ ràng được parser xử lý, không gọi AI lần này.")
     else:
+        ai_snapshot = {"symbols": _compact_snapshot_for_ai(snapshots, prompt_meta)}
         raw_decision = await engine.decide(
             prompt=prompt,
-            snapshot={"symbols": _compact_snapshot_for_ai(snapshots)},
+            snapshot=ai_snapshot,
             risk_config=guard.public_config(),
             skill_context=build_skill_context(mode="strategy_loop", command_or_prompt=prompt),
             prompt_directives=prompt_meta,
         )
+        await _log_ai_result(runtime, settings, ai_snapshot, raw_decision)
         if is_wait_action(raw_decision) and fallback:
             raw_decision = fallback
-            await runtime.log("INFO", "AI trả WAIT nhưng prompt có lịch DCA rõ ràng; bot dùng parser để tạo tín hiệu và vẫn giữ lịch riêng của prompt.")
-        await runtime.log("INFO", "AI đã phân tích prompt đã lưu và tạo tín hiệu.")
+            await runtime.log("INFO", "Parser an toàn: AI trả WAIT nhưng prompt là lệnh đơn giản/DCA rõ ràng, dùng tín hiệu parser.")
+        await runtime.log("INFO", "AI đã phân tích xong.")
+    raw_decision = _apply_prompt_tp_sl_constraints(raw_decision, prompt_meta)
+    if prompt_meta.get("requires_explicit_tp_sl") and str(raw_decision.get("action") or "").upper() in OPENING_ACTIONS:
+        await runtime.log("INFO", "Prompt yêu cầu TP/SL cụ thể theo ATR/RR/structure; bot sẽ không dùng TP/SL mặc định.")
     try:
         result = await analyze_and_execute(user_id=user_id, runtime=runtime, settings=settings, raw_decision=raw_decision, snapshots=snapshots)
     except (RiskError, BybitAPIError) as exc:

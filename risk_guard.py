@@ -255,7 +255,16 @@ class RiskGuard:
         pct_tp, pct_sl = self._apply_explicit_tp_sl_pct(raw, action, market_price)
         take_profit = pct_tp if pct_tp is not None else self._decimal(action.get("take_profit"), "take_profit", required=False)
         stop_loss = pct_sl if pct_sl is not None else self._decimal(action.get("stop_loss"), "stop_loss", required=False)
-        take_profit, stop_loss = self._apply_default_tp_sl(raw, take_profit, stop_loss, market_price)
+
+        explicit_required = str(action.get("require_explicit_tp_sl") or action.get("no_default_tp_sl") or "").lower() in {"1", "true", "yes", "on"}
+        if explicit_required and raw in {"OPEN_LONG", "OPEN_SHORT", "SPOT_BUY"} and (take_profit is None or stop_loss is None):
+            raise RiskError(
+                "Prompt yêu cầu TP/SL cụ thể theo ATR/RR/structure nhưng AI không trả đủ take_profit và stop_loss. "
+                "Bot đã chặn lệnh thay vì dùng TP/SL mặc định."
+            )
+
+        if not explicit_required:
+            take_profit, stop_loss = self._apply_default_tp_sl(raw, take_profit, stop_loss, market_price)
         take_profit, stop_loss = self._round_tp_sl_to_tick(take_profit, stop_loss, price_tick)
 
         if raw == "SPOT_BUY":
