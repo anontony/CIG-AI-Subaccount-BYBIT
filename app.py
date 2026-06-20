@@ -29,7 +29,7 @@ from strategy_parser import parse_strategy_prompt, summarize_strategy_directives
 
 load_dotenv()
 
-app = FastAPI(title="CIG AI Subaccount", version="28.0.0")
+app = FastAPI(title="CIG AI Subaccount", version="30.0.0")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 store = UserStore()
 runtimes = RuntimeManager(log_store=store)
@@ -639,6 +639,115 @@ async def get_instrument_filters(client: BybitClient, symbol: str, category: str
     return qty_step, min_qty, min_order_amt, tick_size
 
 
+async def enforce_tracked_tp_sl(user_id: int, runtime: UserRuntimeState, settings: Dict[str, Any]) -> int:
+    """Actively enforce TP/SL for tracked live trades.
+
+    The dashboard tracker can detect tp_hit/sl_hit from price, but detection alone
+    does not close an exchange position. This function turns a tracker hit into an
+    actual close_position request when live trading is enabled; in dry-run it only
+    marks the tracked row closed. It is intentionally conservative: one close
+    request closes all open tracked rows for the same symbol/side because Bybit
+    futures positions are normally netted by symbol and side.
+    """
+    client = make_client(settings)
+    guard = make_risk_guard(settings, runtime)
+    if not client.is_configured:
+        return 0
+    rows = store.list_tracked_trades(user_id, limit=100)
+    closed_total = 0
+    handled: set[tuple[str, str, str]] = set()
+    for row in rows:
+        if str(row.get("status") or "").lower() != "open":
+            continue
+        category = str(row.get("category") or "").lower()
+        if category not in {"linear", "inverse"}:
+            # Spot TP/SL is tracked visually only unless a separate spot OCO flow is added.
+            continue
+        symbol = str(row.get("symbol") or "").upper().strip()
+        side = str(row.get("side") or "").lower().strip()
+        if not symbol or side not in {"long", "short"}:
+            continue
+        key = (category, symbol, side)
+        if key in handled:
+            continue
+        current_price = ""
+        try:
+            ticker = await client.get_ticker(symbol, category)
+            current_price = str(ticker.get("lastPrice") or ticker.get("markPrice") or "")
+        except Exception as exc:
+            await runtime.log("WARN", f"Không kiểm tra được TP/SL cho {symbol}: {exc}")
+            continue
+        snap = pnl_snapshot(row, current_price)
+        state = str(snap.get("tp_sl_state") or "tracking")
+        if state not in {"tp_hit", "sl_hit"}:
+            continue
+        handled.add(key)
+        close_action = "CLOSE_LONG" if side == "long" else "CLOSE_SHORT"
+        reason = "TP" if state == "tp_hit" else "SL"
+        if guard.config.dry_run:
+            closed = store.close_tracked_trades_for_action(
+                user_id,
+                {"action": close_action, "symbol": symbol, "category": category},
+                current_price=current_price,
+            )
+            closed_total += closed
+            await runtime.log("INFO", f"{reason} đã chạm cho {symbol} {side}; DRY_RUN nên chỉ đóng theo dõi {closed} lệnh.")
+            continue
+        try:
+            await client.close_position(symbol=symbol, target=side, category=category)
+            closed = store.close_tracked_trades_for_action(
+                user_id,
+                {"action": close_action, "symbol": symbol, "category": category},
+                current_price=current_price,
+            )
+            closed_total += closed
+            await runtime.log("WARN", f"{reason} đã chạm cho {symbol} {side}; bot đã gửi lệnh đóng vị thế live và đóng theo dõi {closed} lệnh.")
+        except BybitAPIError as exc:
+            # If Bybit says there is no position, the exchange TP/SL may have closed it already.
+            msg = str(exc)
+            if "Không có position" in msg or "position" in msg.lower() and "no" in msg.lower():
+                closed = store.close_tracked_trades_for_action(
+                    user_id,
+                    {"action": close_action, "symbol": symbol, "category": category},
+                    current_price=current_price,
+                )
+                closed_total += closed
+                await runtime.log("WARN", f"{reason} đã chạm cho {symbol} {side}; Bybit không còn position, đã đóng theo dõi {closed} lệnh.")
+            else:
+                await runtime.log("ERROR", f"{reason} đã chạm nhưng đóng vị thế thất bại: {exc}")
+    return closed_total
+
+
+async def wait_with_tp_sl_monitor(
+    user_id: int,
+    runtime: UserRuntimeState,
+    settings: Dict[str, Any],
+    stop_event: asyncio.Event,
+    total_seconds: int,
+    check_seconds: int = 10,
+) -> None:
+    """Sleep in short chunks while enforcing tracked TP/SL.
+
+    Strategy loops may run every 30 minutes, but TP/SL must be checked much more
+    often. This keeps the strategy schedule intact while still closing live
+    Futures positions when the tracker detects TP/SL hits.
+    """
+    remaining = max(0, int(total_seconds or 0))
+    check_seconds = max(3, int(check_seconds or 10))
+    while remaining > 0 and not stop_event.is_set():
+        try:
+            await enforce_tracked_tp_sl(user_id, runtime, settings)
+        except Exception as exc:
+            await runtime.log("WARN", f"TP/SL monitor lỗi nhưng bot vẫn chạy: {type(exc).__name__}: {exc}")
+        chunk = min(check_seconds, remaining)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=chunk)
+            return
+        except asyncio.TimeoutError:
+            remaining -= chunk
+            continue
+
+
 async def execute_action(client: BybitClient, guard: RiskGuard, normalized: Dict[str, Any], *, qty_step: Decimal | None = None, min_qty: Decimal | None = None) -> Dict[str, Any]:
     action = normalized["action"]
     if action == "WAIT":
@@ -784,14 +893,13 @@ async def bot_loop_safe(user_id: int, stop_event: asyncio.Event) -> None:
             if wait_left > 0:
                 # Do not call AI or Bybit while a recurring/DCA prompt is still in its wait window.
                 # This prevents `10 USDT/1h` from being executed every loop tick.
-                try:
-                    await asyncio.wait_for(stop_event.wait(), timeout=min(wait_left, interval))
-                except asyncio.TimeoutError:
-                    continue
+                await wait_with_tp_sl_monitor(user_id, runtime, settings, stop_event, min(wait_left, interval))
                 continue
 
             conn = await client.test_connection()
             await runtime.log("INFO", f"Bybit connected | env={conn['env']} | clock_drift={conn['clock_drift_seconds']}s")
+
+            await enforce_tracked_tp_sl(user_id, runtime, settings)
 
             snapshots = await build_snapshots_for_guard(client, guard)
             fallback = _action_from_prompt_directives(prompt, prompt_meta)
@@ -821,10 +929,8 @@ async def bot_loop_safe(user_id: int, stop_event: asyncio.Event) -> None:
             except (RiskError, BybitAPIError) as exc:
                 await runtime.log("WARN", f"Action blocked/failed: {exc}")
 
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=interval)
-            except asyncio.TimeoutError:
-                continue
+            await wait_with_tp_sl_monitor(user_id, runtime, settings, stop_event, interval)
+            continue
     except asyncio.CancelledError:
         await runtime.log("INFO", "Tác vụ bot đã bị huỷ.")
     except Exception as exc:
@@ -869,6 +975,7 @@ async def run_saved_prompt_once(user_id: int) -> Dict[str, Any]:
 
     conn = await client.test_connection()
     await runtime.log("INFO", f"Bybit connected | env={conn['env']} | clock_drift={conn['clock_drift_seconds']}s")
+    await enforce_tracked_tp_sl(user_id, runtime, settings)
     snapshots = await build_snapshots_for_guard(client, guard)
     fallback = _action_from_prompt_directives(prompt, prompt_meta)
     use_cost_saver = bool(settings.get("ai_cost_saver", True))
