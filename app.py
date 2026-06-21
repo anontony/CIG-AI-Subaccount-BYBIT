@@ -20,7 +20,7 @@ from skill_sync import background_update_once, check_and_update_skill, read_stat
 from rsa_keys import generate_rsa_key_pair, public_key_from_private
 from bybit_client import BybitAPIError, BybitClient
 from risk_guard import RiskConfig, RiskError, RiskGuard
-from manual_parser import parse_direct_command
+from manual_parser import parse_direct_command, is_clear_trade_execution_command
 from control_parser import parse_control_command, redact_command_for_log
 from session_auth import COOKIE_NAME, create_session_token, read_session_token
 from state import RuntimeManager, UserRuntimeState
@@ -349,6 +349,15 @@ def direct_wait_error(raw_decision: dict) -> str:
     return "Lệnh trực tiếp chưa thể thực thi: " + reason[:260]
 
 
+def should_skip_bot_control_for_command(command: str) -> bool:
+    """Direct execution must not be hijacked by bot-control parsing.
+
+    Examples that must go to execution: "đóng hết lệnh future btc",
+    "long BTC 10u x20", "mua spot BTC 20u".
+    """
+    return is_clear_trade_execution_command(command)
+
+
 def _direct_command_has_explicit_leverage(command: str) -> bool:
     text = (command or "").lower()
     return bool(re.search(r"(đòn|don|đòn bẩy|don bay|leverage|lev)\s*[:=]?\s*\d+|\bx\s*\d+\b|\b\d+\s*x\b", text))
@@ -478,6 +487,158 @@ def _apply_prompt_tp_sl_constraints(raw_decision: Dict[str, Any], prompt_meta: D
         if not decision.get("reason"):
             decision["reason"] = "Prompt yêu cầu TP/SL cụ thể theo ATR/RR/structure."
     return decision
+
+
+
+def _is_exact_rsi_candle_prompt(meta: Dict[str, Any]) -> bool:
+    return bool(meta.get("exact_rsi_candle_strategy") and str(meta.get("primary_timeframe") or "").lower() in {"5m", "m5"})
+
+
+def _is_prompt_only_mode(meta: Dict[str, Any] | None) -> bool:
+    return bool((meta or {}).get("prompt_only_mode") or (meta or {}).get("strict_prompt_only"))
+
+
+def _requested_timeframes_from_meta(meta: Dict[str, Any] | None) -> list[str]:
+    meta = meta or {}
+    allowed = [str(x).lower() for x in (meta.get("allowed_timeframes") or []) if str(x).strip()]
+    if allowed:
+        return allowed
+    primary = str(meta.get("primary_timeframe") or "").lower().strip()
+    if primary:
+        return [primary]
+    tf = str(meta.get("timeframe") or "").upper().strip()
+    mapping = {"5M":"5m", "M5":"5m", "15M":"15m", "M15":"15m", "30M":"30m", "1H":"1h", "H1":"1h", "4H":"4h", "H4":"4h", "1D":"1d", "D1":"1d"}
+    return [mapping[x] for x in tf.split("/") if x in mapping]
+
+
+def _allowed_indicator_names(meta: Dict[str, Any] | None) -> set[str]:
+    meta = meta or {}
+    vals = meta.get("allowed_indicators") or meta.get("indicators") or []
+    return {str(v).upper().strip() for v in vals if str(v).strip()}
+
+
+def _first_symbol_snapshot(ai_snapshot: Dict[str, Any], key: str = "linear:BTCUSDT") -> Dict[str, Any]:
+    symbols = ai_snapshot.get("symbols") if isinstance(ai_snapshot, dict) else {}
+    if isinstance(symbols, dict):
+        snap = symbols.get(key)
+        if isinstance(snap, dict):
+            return snap
+        if symbols:
+            first = next(iter(symbols.values()))
+            return first if isinstance(first, dict) else {}
+    return {}
+
+
+def _last_candle_colors(pack: Dict[str, Any], count: int = 2) -> list[str]:
+    candles = pack.get("recent_candles") if isinstance(pack, dict) else []
+    if not isinstance(candles, list):
+        return []
+    colors = []
+    for c in candles[:count]:
+        if isinstance(c, dict):
+            colors.append(str(c.get("color") or "").lower())
+    return colors
+
+
+def _has_open_position_same_side(snap: Dict[str, Any], action: str) -> bool:
+    positions = snap.get("positions") if isinstance(snap, dict) else []
+    if not isinstance(positions, list):
+        return False
+    want = "Buy" if action == "OPEN_LONG" else "Sell" if action == "OPEN_SHORT" else ""
+    for pos in positions:
+        if not isinstance(pos, dict):
+            continue
+        side = str(pos.get("side") or "").strip()
+        try:
+            size = Decimal(str(pos.get("size") or "0"))
+        except Exception:
+            size = Decimal("0")
+        if size > 0 and side.lower() == want.lower():
+            return True
+    return False
+
+
+def _evaluate_exact_rsi_candle_prompt(prompt_meta: Dict[str, Any], ai_snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """Deterministic evaluator for prompts that explicitly define RSI 5m + candle rules.
+
+    This mode intentionally ignores unmentioned H1/H4/D1/EMA/MACD rules. It prevents
+    the LLM from self-authoring a different strategy such as multi-timeframe EMA short.
+    """
+    snap = _first_symbol_snapshot(ai_snapshot, "linear:BTCUSDT")
+    symbol = snap.get("symbol") or "BTCUSDT"
+    tfs = snap.get("timeframes") if isinstance(snap.get("timeframes"), dict) else {}
+    tf5 = tfs.get("5m") if isinstance(tfs, dict) else {}
+    if not isinstance(tf5, dict) or tf5.get("error"):
+        return {
+            "action": "WAIT", "category": "linear", "symbol": symbol, "confidence": 0,
+            "reason": f"KHÔNG VÀO LỆNH: 1) thiếu dữ liệu 5m hợp lệ nên không kiểm tra được RSI 5m; 2) chiến lược này chỉ cho phép RSI 5m + 2 nến xác nhận, không dùng H1/H4/D1 để tự mở lệnh.",
+            "_deterministic_exact_prompt": True,
+        }
+    ind = tf5.get("indicators") if isinstance(tf5.get("indicators"), dict) else {}
+    rsi5 = None
+    try:
+        rsi5 = float(ind.get("rsi14")) if ind.get("rsi14") is not None else None
+    except Exception:
+        rsi5 = None
+    colors = _last_candle_colors(tf5, int(prompt_meta.get("candle_confirm_count") or 2))
+    if rsi5 is None:
+        return {
+            "action": "WAIT", "category": "linear", "symbol": symbol, "confidence": 0,
+            "reason": "KHÔNG VÀO LỆNH: 1) snapshot có 5m nhưng thiếu RSI14 5m; 2) không được dùng chỉ báo khác thay thế vì prompt chỉ định RSI 5m.",
+            "_deterministic_exact_prompt": True,
+        }
+
+    long_threshold = prompt_meta.get("rsi_long_below")
+    short_threshold = prompt_meta.get("rsi_short_above")
+    n = int(prompt_meta.get("candle_confirm_count") or 2)
+    long_ok = long_threshold is not None and rsi5 < float(long_threshold) and len(colors) >= n and all(c == "green" for c in colors[:n])
+    short_ok = short_threshold is not None and rsi5 > float(short_threshold) and len(colors) >= n and all(c == "red" for c in colors[:n])
+    if long_ok and _has_open_position_same_side(snap, "OPEN_LONG"):
+        return {
+            "action": "WAIT", "category": "linear", "symbol": symbol, "confidence": 0,
+            "reason": f"KHÔNG VÀO LỆNH: 1) RSI 5m={rsi5:.2f} và {n} nến xanh đạt điều kiện Long; 2) đã có vị thế Long/Buy cùng chiều nên không mở trùng lệnh.",
+            "_deterministic_exact_prompt": True,
+        }
+    if short_ok and _has_open_position_same_side(snap, "OPEN_SHORT"):
+        return {
+            "action": "WAIT", "category": "linear", "symbol": symbol, "confidence": 0,
+            "reason": f"KHÔNG VÀO LỆNH: 1) RSI 5m={rsi5:.2f} và {n} nến đỏ đạt điều kiện Short; 2) đã có vị thế Short/Sell cùng chiều nên không mở trùng lệnh.",
+            "_deterministic_exact_prompt": True,
+        }
+
+    base = {
+        "category": "linear",
+        "symbol": symbol,
+        "leverage": int(prompt_meta.get("leverage") or 20),
+        "entry_type": "market",
+        "margin_usdt": prompt_meta.get("futures_margin_usdt") or 10,
+        "risk_usdt": 1,
+        "take_profit_pct": prompt_meta.get("take_profit_pct"),
+        "stop_loss_pct": prompt_meta.get("stop_loss_pct"),
+        "_deterministic_exact_prompt": True,
+    }
+    if long_ok:
+        return {
+            **base,
+            "action": "OPEN_LONG",
+            "confidence": 70,
+            "reason": f"Đúng rule gốc: RSI 5m={rsi5:.2f} < {float(long_threshold):g} và {n} nến gần nhất đều xanh ({colors[:n]}). Dùng đúng prompt RSI 5m, không dùng H1/H4/D1.",
+        }
+    if short_ok:
+        return {
+            **base,
+            "action": "OPEN_SHORT",
+            "confidence": 70,
+            "reason": f"Đúng rule gốc: RSI 5m={rsi5:.2f} > {float(short_threshold):g} và {n} nến gần nhất đều đỏ ({colors[:n]}). Dùng đúng prompt RSI 5m, không dùng H1/H4/D1.",
+        }
+
+    needed_long = f"RSI 5m < {long_threshold:g} + {n} nến xanh" if long_threshold is not None else "không có rule Long"
+    needed_short = f"RSI 5m > {short_threshold:g} + {n} nến đỏ" if short_threshold is not None else "không có rule Short"
+    return {
+        "action": "WAIT", "category": "linear", "symbol": symbol, "confidence": 0,
+        "reason": f"KHÔNG VÀO LỆNH: 1) rule Long chưa đạt ({needed_long}); 2) rule Short chưa đạt ({needed_short}). Hiện RSI 5m={rsi5:.2f}, {n} nến gần nhất={colors[:n]}. Bot không dùng EMA/MACD/H1/H4/D1 vì prompt gốc chỉ yêu cầu RSI 5m + nến 5m.",
+        "_deterministic_exact_prompt": True,
+    }
 
 def _is_simple_dca_or_direct_prompt(prompt: str, meta: Dict[str, Any]) -> bool:
     """Return True only for deterministic execution prompts safe to run without AI.
@@ -643,18 +804,25 @@ async def _timeframe_pack(client: BybitClient, symbol: str, category: str, inter
     }
 
 
-async def build_market_snapshot(client: BybitClient, symbol: str, category: str) -> Dict[str, Any]:
+async def build_market_snapshot(client: BybitClient, symbol: str, category: str, prompt_meta: Dict[str, Any] | None = None) -> Dict[str, Any]:
     ticker = await client.get_ticker(symbol, category)
 
-    # Strategy prompts in this app commonly reference D1/H4/H1. Older builds only
-    # sent 15m data, causing the AI to WAIT or fail TP/SL calculation for ATR/RR
-    # strategies. V38 sends the required multi-timeframe snapshot.
-    timeframe_specs = {
+    # V47: fetch only the prompt-requested timeframe in prompt-only mode.
+    # This prevents an RSI 5m prompt from receiving D1/H4/H1/EMA/MACD context
+    # that could authorize a different strategy.
+    all_timeframe_specs = {
+        "5m": "5",
         "15m": "15",
+        "30m": "30",
         "1h": "60",
         "4h": "240",
         "1d": "D",
     }
+    if _is_prompt_only_mode(prompt_meta):
+        wanted = _requested_timeframes_from_meta(prompt_meta) or ["15m"]
+        timeframe_specs = {k: v for k, v in all_timeframe_specs.items() if k in wanted}
+    else:
+        timeframe_specs = {k: all_timeframe_specs[k] for k in ["5m", "15m", "1h", "4h", "1d"]}
     timeframes: Dict[str, Any] = {}
     for label, interval in timeframe_specs.items():
         try:
@@ -668,6 +836,8 @@ async def build_market_snapshot(client: BybitClient, symbol: str, category: str)
         positions = await client.get_positions(symbol, category)
 
     # Keep legacy fields for older UI / Risk Guard code while adding new multi-TF fields.
+    indicators_5m = (timeframes.get("5m") or {}).get("indicators", {})
+    klines_5m = (timeframes.get("5m") or {}).get("klines", {})
     indicators_15m = (timeframes.get("15m") or {}).get("indicators", {})
     klines_15m = (timeframes.get("15m") or {}).get("klines", {})
     return {
@@ -675,6 +845,8 @@ async def build_market_snapshot(client: BybitClient, symbol: str, category: str)
         "category": category,
         "ticker": ticker,
         "timeframes": timeframes,
+        "klines_5m": klines_5m,
+        "indicators_5m": indicators_5m,
         "klines_15m": klines_15m,
         "indicators_15m": indicators_15m,
         "indicators_1h": (timeframes.get("1h") or {}).get("indicators", {}),
@@ -688,7 +860,7 @@ async def build_market_snapshot(client: BybitClient, symbol: str, category: str)
     }
 
 
-async def build_snapshots_for_guard(client: BybitClient, guard: RiskGuard) -> Dict[str, Any]:
+async def build_snapshots_for_guard(client: BybitClient, guard: RiskGuard, prompt_meta: Dict[str, Any] | None = None) -> Dict[str, Any]:
     snapshots: Dict[str, Any] = {}
     for category in categories_for_guard(guard):
         for symbol in allowed_symbols_from_guard(guard):
@@ -759,16 +931,40 @@ def _tf_brief(pack: Dict[str, Any] | None) -> str:
     struct = pack.get("structure") or {}
     if ind.get("status") and ind.get("status") != "ok":
         return f"lỗi {ind.get('status')}"
-    trend = ind.get("trend") or "-"
-    rsi = _fmt_num(ind.get("rsi14"), 1)
-    macd = ((ind.get("macd") or {}).get("bias") or "-") if isinstance(ind.get("macd"), dict) else "-"
-    ema50 = _fmt_num(ind.get("ema50"), 0)
-    ema200 = _fmt_num(ind.get("ema200"), 0)
-    sr = ""
+    fields = []
+    if ind.get("rsi14") is not None:
+        fields.append(f"RSI {_fmt_num(ind.get('rsi14'), 1)}")
+    if ind.get("trend") is not None:
+        fields.append(f"trend {ind.get('trend')}")
+    if isinstance(ind.get("macd"), dict):
+        fields.append(f"MACD {((ind.get('macd') or {}).get('bias') or '-')}")
+    ema_parts = []
+    if ind.get("ema20") is not None:
+        ema_parts.append("20=" + _fmt_num(ind.get("ema20"), 0))
+    if ind.get("ema50") is not None:
+        ema_parts.append("50=" + _fmt_num(ind.get("ema50"), 0))
+    if ind.get("ema200") is not None:
+        ema_parts.append("200=" + _fmt_num(ind.get("ema200"), 0))
+    if ema_parts:
+        fields.append("EMA " + "/".join(ema_parts))
+    if ind.get("atr14") is not None:
+        fields.append(f"ATR {_fmt_num(ind.get('atr14'), 1)}")
+    if ind.get("volume_status") is not None:
+        fields.append(f"Volume {ind.get('volume_status')}")
+    candles = pack.get("recent_candles") or []
+    if isinstance(candles, list) and candles:
+        colors = [str(c.get("color") or "?") for c in candles[:3] if isinstance(c, dict)]
+        if colors:
+            fields.append("nến " + ",".join(colors))
     if struct:
-        sr = f" · S/R {_fmt_num(struct.get('recent_support'),0)}/{_fmt_num(struct.get('recent_resistance'),0)}"
-    return f"{trend} · RSI {rsi} · MACD {macd} · EMA50/200 {ema50}/{ema200}{sr}"
-
+        sr_parts = []
+        if struct.get("recent_support") is not None:
+            sr_parts.append("S=" + _fmt_num(struct.get("recent_support"),0))
+        if struct.get("recent_resistance") is not None:
+            sr_parts.append("R=" + _fmt_num(struct.get("recent_resistance"),0))
+        if sr_parts:
+            fields.append("/".join(sr_parts))
+    return " · ".join(fields) if fields else "không có chỉ báo được phép theo prompt"
 
 def _market_snapshot_brief(ai_snapshot: Dict[str, Any]) -> str:
     symbols = ai_snapshot.get("symbols") if isinstance(ai_snapshot, dict) else None
@@ -786,7 +982,10 @@ def _market_snapshot_brief(ai_snapshot: Dict[str, Any]) -> str:
     price = _fmt_num(snap.get("price"), 2)
     tfs = snap.get("timeframes") or {}
     parts = [f"Market {cat} {sym} giá {price}"]
-    for label in ("1d", "4h", "1h", "15m"):
+    # Show the low timeframe first when it exists so custom 5m scalping prompts
+    # are visible in Live Log instead of being buried under D1/H4/H1.
+    order = ("5m", "15m", "1h", "4h", "1d") if "5m" in tfs else ("1d", "4h", "1h", "15m")
+    for label in order:
         if label in tfs:
             parts.append(f"{label.upper()}: {_tf_brief(tfs.get(label))}")
     return " · ".join(parts)
@@ -831,16 +1030,58 @@ async def _log_ai_result(runtime: UserRuntimeState, settings: Dict[str, Any], ai
             await runtime.log("DEBUG", "AI DEBUG · RAW AI RESPONSE: <không có raw response>")
         await runtime.log("DEBUG", "AI DEBUG · PARSED SIGNAL: " + _short_json(_debug_signal_view(raw_decision), 1600))
 
+def _filter_indicators_for_prompt(indicators: Dict[str, Any], meta: Dict[str, Any] | None) -> Dict[str, Any]:
+    indicators = indicators or {}
+    meta = meta or {}
+    if not _is_prompt_only_mode(meta):
+        return indicators
+    allowed = _allowed_indicator_names(meta)
+    # Always keep status/last_close so the decision can reference current price/validity.
+    out: Dict[str, Any] = {}
+    for k in ["status", "last_close"]:
+        if k in indicators:
+            out[k] = indicators.get(k)
+    if "RSI" in allowed and "rsi14" in indicators:
+        out["rsi14"] = indicators.get("rsi14")
+    if "EMA" in allowed:
+        for k in ["trend", "ema20", "ema50", "ema200"]:
+            if k in indicators:
+                out[k] = indicators.get(k)
+    if "MACD" in allowed and "macd" in indicators:
+        out["macd"] = indicators.get("macd")
+    if "ATR" in allowed and "atr14" in indicators:
+        out["atr14"] = indicators.get("atr14")
+    if "VOLUME" in allowed or "VOL" in allowed:
+        for k in ["volume_ma20", "volume_status"]:
+            if k in indicators:
+                out[k] = indicators.get(k)
+    if "SMA" in allowed:
+        # No SMA fields currently computed except MA-style volume; keep none by default.
+        pass
+    return out
+
+
+def _allow_structure_for_prompt(meta: Dict[str, Any] | None) -> bool:
+    if not _is_prompt_only_mode(meta):
+        return True
+    meta = meta or {}
+    text_bits = " ".join(str(x).lower() for x in [meta.get("tp_sl_mode"), *(meta.get("rsi_rules") or []), *(meta.get("indicators") or [])])
+    return any(k in text_bits for k in ["support", "resistance", "swing", "structure", "ho tro", "khang cu", "cau truc"])
+
+
 def _compact_snapshot_for_ai(snapshots: Dict[str, Any], prompt_meta: Dict[str, Any] | None = None) -> Dict[str, Any]:
     """Trim Bybit snapshots before sending them to the LLM.
 
-    For strategy prompts, focus on the requested market/symbol to reduce token
-    pressure and prevent models from returning empty `{}` on oversized payloads.
+    V47 invariant: in Prompt-Only Mode, send ONLY the timeframe/indicator the
+    saved prompt explicitly requested. Do not send D1/H4/H1 or EMA/MACD if the
+    prompt only asked for RSI 5m.
     """
     compact: Dict[str, Any] = {}
     meta = prompt_meta or {}
     wanted_symbols = set(meta.get("symbols") or [])
     wanted_market = str(meta.get("market") or "").lower().strip()
+    prompt_only = _is_prompt_only_mode(meta)
+    requested_tfs = _requested_timeframes_from_meta(meta)
     for key, snap in (snapshots or {}).items():
         if wanted_symbols or wanted_market:
             try:
@@ -872,29 +1113,48 @@ def _compact_snapshot_for_ai(snapshots: Dict[str, Any], prompt_meta: Dict[str, A
             pack = ((snap.get("timeframes") or {}).get(label) or {}) if isinstance(snap.get("timeframes"), dict) else {}
             if pack.get("error"):
                 return {"error": pack.get("error")}
-            return {
-                "indicators": pack.get("indicators") or {},
-                "structure": pack.get("structure") or {},
+            kl = pack.get("klines") or {}
+            out: Dict[str, Any] = {
+                "indicators": _filter_indicators_for_prompt(pack.get("indicators") or {}, meta),
+                "recent_candles": kl.get("recent_candles") or [],
+            }
+            if _allow_structure_for_prompt(meta):
+                out["structure"] = pack.get("structure") or {}
+            return out
+
+        if prompt_only:
+            labels = requested_tfs or ([str(meta.get("primary_timeframe") or "").lower()] if meta.get("primary_timeframe") else ["15m"])
+            tf_map = {label: tf(label) for label in labels if label}
+        else:
+            tf_map = {
+                "5m": tf("5m"),
+                "15m": tf("15m"),
+                "1h": tf("1h"),
+                "4h": tf("4h"),
+                "1d": tf("1d"),
             }
 
-        compact[key] = {
+        row = {
             "symbol": snap.get("symbol"),
             "category": snap.get("category"),
             "price": ticker.get("lastPrice") or ticker.get("markPrice"),
             "bid1Price": ticker.get("bid1Price"),
             "ask1Price": ticker.get("ask1Price"),
-            "price24hPcnt": ticker.get("price24hPcnt"),
-            "volume24h": ticker.get("volume24h"),
-            "timeframes": {
-                "1d": tf("1d"),
-                "4h": tf("4h"),
-                "1h": tf("1h"),
-                "15m": tf("15m"),
-            },
-            # Legacy alias for existing prompts/debug comparisons.
-            "indicators_15m": snap.get("indicators_15m") or {},
+            "timeframes": tf_map,
             "positions": compact_positions,
         }
+        if not prompt_only:
+            row.update({
+                "price24hPcnt": ticker.get("price24hPcnt"),
+                "volume24h": ticker.get("volume24h"),
+                "indicators_5m": snap.get("indicators_5m") or {},
+                "indicators_15m": snap.get("indicators_15m") or {},
+            })
+        else:
+            row["prompt_only_mode"] = True
+            row["allowed_timeframes"] = requested_tfs
+            row["allowed_indicators"] = list(_allowed_indicator_names(meta))
+        compact[key] = row
     return compact
 
 async def get_instrument_filters(client: BybitClient, symbol: str, category: str) -> tuple[Decimal, Decimal, Decimal | None, Decimal]:
@@ -1197,20 +1457,25 @@ async def bot_loop_safe(user_id: int, stop_event: asyncio.Event) -> None:
 
             await enforce_tracked_tp_sl(user_id, runtime, settings)
 
-            snapshots = await build_snapshots_for_guard(client, guard)
+            snapshots = await build_snapshots_for_guard(client, guard, prompt_meta)
             fallback = _action_from_prompt_directives(prompt, prompt_meta)
             use_cost_saver = bool(settings.get("ai_cost_saver", True))
             has_indicator_condition = bool(prompt_meta.get("rsi_rules") or prompt_meta.get("indicators"))
-            if use_cost_saver and fallback and not has_indicator_condition:
+            ai_snapshot = {"symbols": _compact_snapshot_for_ai(snapshots, prompt_meta)}
+            if _is_exact_rsi_candle_prompt(prompt_meta):
+                raw_decision = _evaluate_exact_rsi_candle_prompt(prompt_meta, ai_snapshot)
+                await _log_ai_result(runtime, settings, ai_snapshot, raw_decision)
+                await runtime.log("INFO", "Đã xử lý bằng rule engine đúng prompt gốc: RSI 5m + nến 5m. Không gọi AI để tránh tự biên chiến lược khác.")
+                await runtime.log("INFO", "AI đã phân tích xong.")
+            elif use_cost_saver and fallback and not has_indicator_condition:
                 raw_decision = fallback
                 await runtime.log("INFO", "Tiết kiệm token: prompt DCA/lệnh rõ ràng được parser xử lý, không gọi AI vòng này.")
             else:
-                ai_snapshot = {"symbols": _compact_snapshot_for_ai(snapshots, prompt_meta)}
                 raw_decision = await engine.decide(
                     prompt=prompt,
                     snapshot=ai_snapshot,
                     risk_config=guard.public_config(),
-                    skill_context=build_skill_context(mode="strategy_loop", command_or_prompt=prompt),
+                    skill_context=("" if _is_prompt_only_mode(prompt_meta) else build_skill_context(mode="strategy_loop", command_or_prompt=prompt)),
                     prompt_directives=prompt_meta,
                 )
                 await _log_ai_result(runtime, settings, ai_snapshot, raw_decision)
@@ -1288,20 +1553,25 @@ async def run_saved_prompt_once(user_id: int) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=msg)
     await runtime.log("INFO", f"Bybit OK · env={conn['env']} · lệch giờ={conn['clock_drift_seconds']}s")
     await enforce_tracked_tp_sl(user_id, runtime, settings)
-    snapshots = await build_snapshots_for_guard(client, guard)
+    snapshots = await build_snapshots_for_guard(client, guard, prompt_meta)
     fallback = _action_from_prompt_directives(prompt, prompt_meta)
     use_cost_saver = bool(settings.get("ai_cost_saver", True))
     has_indicator_condition = bool(prompt_meta.get("rsi_rules") or prompt_meta.get("indicators"))
-    if use_cost_saver and fallback and not has_indicator_condition:
+    ai_snapshot = {"symbols": _compact_snapshot_for_ai(snapshots, prompt_meta)}
+    if _is_exact_rsi_candle_prompt(prompt_meta):
+        raw_decision = _evaluate_exact_rsi_candle_prompt(prompt_meta, ai_snapshot)
+        await _log_ai_result(runtime, settings, ai_snapshot, raw_decision)
+        await runtime.log("INFO", "Đã xử lý bằng rule engine đúng prompt gốc: RSI 5m + nến 5m. Không gọi AI để tránh tự biên chiến lược khác.")
+        await runtime.log("INFO", "AI đã phân tích xong.")
+    elif use_cost_saver and fallback and not has_indicator_condition:
         raw_decision = fallback
         await runtime.log("INFO", "Tiết kiệm token: prompt rõ ràng được parser xử lý, không gọi AI lần này.")
     else:
-        ai_snapshot = {"symbols": _compact_snapshot_for_ai(snapshots, prompt_meta)}
         raw_decision = await engine.decide(
             prompt=prompt,
             snapshot=ai_snapshot,
             risk_config=guard.public_config(),
-            skill_context=build_skill_context(mode="strategy_loop", command_or_prompt=prompt),
+            skill_context=("" if _is_prompt_only_mode(prompt_meta) else build_skill_context(mode="strategy_loop", command_or_prompt=prompt)),
             prompt_directives=prompt_meta,
         )
         await _log_ai_result(runtime, settings, ai_snapshot, raw_decision)
@@ -1532,10 +1802,13 @@ async def direct_command(payload: CommandIn, user: Dict[str, Any] = Depends(curr
         await runtime.log("INFO", "Lệnh trực tiếp đã tạo RSA Public Key riêng cho user này. Copy public key trong mục Cài đặt API & Rủi ro rồi dán vào Bybit.")
         return {"ok": True, "mode": "bot_control", "result": {"type": "RSA_GENERATED", "message": "Đã tạo RSA Public Key riêng cho user này.", "public_key": pair["public_key"], "settings_changed": {"bybit_auth_type": saved.get("bybit_auth_type")}}}
 
-    # 1) Ưu tiên xử lý lệnh điều khiển bot/workspace trước lệnh giao dịch.
-    # Nhờ vậy user có thể gõ: "đổi đòn bẩy tối đa thành 10x",
-    # "đổi prompt thành...", "chỉ trade BTCUSDT", "bật dry run" mà không cần Bybit key.
-    control = parse_control_command(command, settings, current_prompt)
+    # 1) Ưu tiên xử lý lệnh điều khiển bot/workspace trước lệnh giao dịch,
+    # NHƯNG không được để control parser bắt nhầm lệnh execution trực tiếp.
+    # Ví dụ: "đóng hết lệnh future btc" phải đi vào direct execution, không phải allowed_symbols/control.
+    skip_control_for_trade = should_skip_bot_control_for_command(command)
+    control = {"matched": False}
+    if not skip_control_for_trade:
+        control = parse_control_command(command, settings, current_prompt)
     if control.get("matched"):
         safe_command = redact_command_for_log(command)
         await runtime.log("INFO", f"Nhận lệnh điều chỉnh bot: {safe_command}")
@@ -1605,8 +1878,12 @@ async def direct_command(payload: CommandIn, user: Dict[str, Any] = Depends(curr
     try:
         snapshots = await build_snapshots_for_guard(client, guard)
         parsed_first = parse_direct_command(command, allowed_symbols_from_guard(guard), guard.config.default_category)
+        clear_direct = should_skip_bot_control_for_command(command)
         use_cost_saver = bool(settings.get("ai_cost_saver", True))
-        if use_cost_saver and not is_wait_action(parsed_first):
+        if clear_direct and not is_wait_action(parsed_first):
+            raw_decision = parsed_first
+            await runtime.log("INFO", "Direct Command: đã hiểu bằng parser nội bộ, không gọi AI để tránh tự biên chiến lược khác.")
+        elif use_cost_saver and not is_wait_action(parsed_first):
             raw_decision = parsed_first
             await runtime.log("INFO", "Tiết kiệm token: lệnh trực tiếp rõ ràng được parser xử lý, không gọi AI.")
         elif engine.enabled:

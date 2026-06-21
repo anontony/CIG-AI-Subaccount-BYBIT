@@ -69,6 +69,42 @@ def _infer_market(ascii_text: str, default_category: str) -> str:
     return "linear" if default_category in {"auto", "linear", "inverse"} else default_category
 
 
+
+
+def is_clear_trade_execution_command(command: str) -> bool:
+    """Return True for commands that should be treated as trading execution, not bot settings.
+
+    This prevents phrases like "đóng hết lệnh future btc" from being routed
+    through workspace/control parsing or AI strategy reasoning.
+    """
+    ascii_text = _strip_accents((command or "").lower())
+    if not ascii_text.strip():
+        return False
+
+    # Bot-control phrases should remain bot-control, even if they contain words like "trade".
+    control_markers = [
+        "doi prompt", "cap nhat prompt", "thay prompt", "them vao prompt", "bo sung prompt",
+        "allowed symbols", "danh sach symbol", "chi trade", "doi symbol", "cap nhat symbol",
+        "max leverage", "don bay toi da", "margin toi da", "max margin",
+        "dry run", "mo phong", "testnet", "mainnet", "openai model", "model:", "model=",
+        "bat bot", "tat bot", "stop bot", "start bot",
+    ]
+    if any(k in ascii_text for k in control_markers):
+        return False
+
+    close_markers = [
+        "dong lenh", "dong het lenh", "dong tat ca lenh", "dong het", "dong vi the",
+        "thoat lenh", "thoat vi the", "cat lenh", "tat lenh",
+        "close position", "close all", "close order", "close trade", "close futures", "close future",
+    ]
+    open_markers = [
+        "open long", "open short", "vao long", "vao short", "future long", "future short",
+        "futures long", "futures short", "long btc", "short btc", "long eth", "short eth",
+        "mua btc", "mua bitcoin", "buy btc", "buy bitcoin", "ban btc", "sell btc",
+        "spot mua", "mua spot", "ban spot", "sell spot",
+    ]
+    return any(k in ascii_text for k in close_markers + open_markers)
+
 def parse_direct_command(command: str, allowed_symbols: List[str], default_category: str = "auto") -> Dict[str, Any]:
     """Conservative Vietnamese/English fallback parser for simple trade commands."""
     original = command.strip()
@@ -76,11 +112,24 @@ def parse_direct_command(command: str, allowed_symbols: List[str], default_categ
     ascii_text = _strip_accents(text)
     symbol = _find_symbol(original, allowed_symbols)
 
+    close_intent = any(w in ascii_text for w in [
+        "dong", "close", "thoat", "tat lenh", "cat lenh",
+        "dong het", "dong tat ca", "dong vi the", "thoat vi the", "close all", "close position"
+    ])
+
     if not symbol:
-        return {"action": "WAIT", "reason": "Không nhận diện được symbol nằm trong allowed_symbols."}
+        # For closing commands, if the workspace has only one allowed symbol, use it.
+        # This lets commands like "đóng hết lệnh future" work in a BTC-only workspace.
+        allowed_clean = [s.upper().strip() for s in allowed_symbols if str(s).strip()]
+        if close_intent and len(allowed_clean) == 1:
+            symbol = allowed_clean[0]
+        else:
+            return {"action": "WAIT", "reason": "Không nhận diện được symbol nằm trong allowed_symbols."}
 
     category = _infer_market(ascii_text, default_category)
-    close_intent = any(w in ascii_text for w in ["dong", "close", "thoat", "tat lenh", "cat lenh"])
+    # Explicit future/perp/linear words force futures for close commands.
+    if close_intent and any(w in ascii_text for w in ["future", "futures", "perp", "perpetual", "linear", "hop dong", "don bay", "leverage", "x20", "x10"]):
+        category = "linear"
     sell_all = close_intent or any(w in ascii_text for w in ["ban het", "sell all", "xoa het spot"])
 
     if category == "spot":

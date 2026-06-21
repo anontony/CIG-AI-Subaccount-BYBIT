@@ -434,6 +434,21 @@ def _deterministic_signal_from_snapshot(user_payload: Dict[str, Any]) -> Dict[st
             "_deterministic_recovery": True,
         }
 
+    directives = user_payload.get("prompt_directives") if isinstance(user_payload.get("prompt_directives"), dict) else {}
+    if directives.get("prompt_only_mode") or directives.get("strict_prompt_only"):
+        tf = str(directives.get("primary_timeframe") or (directives.get("allowed_timeframes") or ["-"])[0]).lower()
+        inds = ",".join(str(x) for x in (directives.get("allowed_indicators") or directives.get("indicators") or [])) or "chỉ báo trong prompt"
+        return {
+            "action": "WAIT",
+            "category": "linear",
+            "symbol": "BTCUSDT",
+            "confidence": 0,
+            "reason": f"KHÔNG VÀO LỆNH: AI trả object rỗng {{}}; bot đang ở Prompt-Only Mode nên không dùng chiến lược phục hồi H1/H4/EMA/MACD. Chỉ được dùng {tf}/{inds} theo prompt gốc; thiếu tín hiệu hợp lệ nên WAIT.",
+            "_empty_ai_object": True,
+            "_deterministic_recovery": True,
+            "_prompt_only_mode": True,
+        }
+
     price = _float_or_none(btc.get("price"))
     d1, _ = _tf_parts(btc, "1d")
     h4, _ = _tf_parts(btc, "4h")
@@ -573,9 +588,22 @@ def _compact_retry_payload(user_payload: Dict[str, Any]) -> Dict[str, Any]:
         btc = next(iter(symbols.values()))
     prompt = str(user_payload.get("user_trading_prompt") or "")
     directives = user_payload.get("prompt_directives") if isinstance(user_payload.get("prompt_directives"), dict) else {}
-    return {
-        "task": "Return exactly one trading signal JSON. Prefer WAIT unless the setup is clear and concrete SL/TP can be computed.",
-        "strategy_summary": {
+    prompt_only = bool(directives.get("prompt_only_mode") or directives.get("strict_prompt_only"))
+    if prompt_only:
+        strategy_summary = {
+            "mode": "PROMPT_ONLY_STRICT",
+            "rule": "Use ONLY raw_prompt_excerpt + extracted_directives + provided market_snapshot. Do not apply default scalping, EMA, MACD, H1/H4/D1 unless the prompt explicitly asked for them.",
+            "allowed_timeframes": directives.get("allowed_timeframes") or [directives.get("primary_timeframe")],
+            "allowed_indicators": directives.get("allowed_indicators") or directives.get("indicators") or [],
+            "hard_blocks": [
+                "Never return {}",
+                "Never use unmentioned timeframes",
+                "Never use unmentioned indicators",
+                "If the exact prompt condition is not satisfied, WAIT",
+            ],
+        }
+    else:
+        strategy_summary = {
             "market": "linear futures",
             "symbol": "BTCUSDT",
             "leverage_default": 10,
@@ -583,7 +611,7 @@ def _compact_retry_payload(user_payload: Dict[str, Any]) -> Dict[str, Any]:
             "risk_usdt_default": 1,
             "min_confidence": 55,
             "min_rr": 1.2,
-            "timeframes": "Use D1/H4 for context, H1 for entry and ATR/SL/TP, 15m only as confirmation.",
+            "timeframes": "Respect prompt timeframe. If prompt says 5m/M5, use 5m RSI and recent_candles as primary. Otherwise use D1/H4/H1 and 15m as confirmation.",
             "short_relaxed": "Short is allowed when D1 or H4 downtrend and H1 has weak pullback/rejection near EMA/support-resistance, with concrete SL above swing/resistance and TP >= 1.2R.",
             "long_relaxed": "Long is allowed only when H4 is not strongly downtrend or H1 turns clearly bullish, with concrete SL below swing/support and TP >= 1.2R.",
             "hard_blocks": [
@@ -593,7 +621,10 @@ def _compact_retry_payload(user_payload: Dict[str, Any]) -> Dict[str, Any]:
                 "Never open if RR < 1.2R",
                 "If unclear, WAIT with at least 2 concrete reasons from snapshot",
             ],
-        },
+        }
+    return {
+        "task": "Return exactly one trading signal JSON. Prefer WAIT unless the setup is clear and concrete SL/TP can be computed.",
+        "strategy_summary": strategy_summary,
         "extracted_directives": directives,
         "raw_prompt_excerpt": prompt[:2500],
         "risk_config": user_payload.get("risk_config") or {},
@@ -758,12 +789,13 @@ Hard rules:
 - Use the provided snapshots. Snapshot keys are formatted like "linear:BTCUSDT" and "spot:BTCUSDT".
 - Respect the strategy prompt exactly, including recurring schedule, market type, symbols, leverage, TP/SL, timeframe, and indicator rules such as RSI / EMA / MACD / volume conditions.
 - If prompt_directives are provided, treat them as extracted constraints from the prompt and keep them aligned with the raw prompt text.
+- CRITICAL Prompt-Only Mode: if prompt_directives.prompt_only_mode or prompt_directives.strict_prompt_only is true, you may use ONLY the timeframes and indicators explicitly allowed in prompt_directives.allowed_timeframes and prompt_directives.allowed_indicators. Do NOT use D1/H4/H1, EMA, MACD, ATR, support/resistance, trend, or volume unless the original prompt explicitly requested them and they are present in the snapshot. If the allowed data is insufficient, return WAIT.
 - If prompt_directives.requires_explicit_tp_sl is true, you MUST NOT return OPEN_LONG or OPEN_SHORT unless both stop_loss and take_profit are concrete numeric prices. If you cannot compute them from the snapshot, return WAIT with a clear Vietnamese reason.
 - WAIT reason rule: when action is WAIT, reason MUST be Vietnamese and MUST list at least 2 concrete failed conditions from the current snapshot/prompt. Use the format: "KHÔNG VÀO LỆNH: 1) ...; 2) ...". Never return reason as empty, null, none, or "No reason provided". Do not use vague text such as "setup chưa đủ điều kiện" without naming the failed conditions. Include the exact missing/failed data points whenever available, for example: D1/H4 trend unknown, H1 pullback not present, RSI not in zone, MACD not confirmed, ATR insufficient, or cannot calculate concrete SL/TP.
 - Recurring/DCA cadence such as every 1 hour, mỗi 1 tiếng, 10 USDT/1h is enforced by the bot scheduler outside the AI. When invoked, assume the scheduler has decided this is an eligible execution window; do not ignore a clear DCA buy solely because it contains a time interval.
-- Prefer multi-timeframe data when available: timeframes.1d, timeframes.4h, and timeframes.1h. Use 1d/4h for trend context, 1h for entry/pullback and ATR-based TP/SL, and 15m only as extra short-term confirmation.
+- Respect the prompt timeframe before any default timeframe. If the prompt says 5m/M5/khung 5m, use snapshot.timeframes["5m"] as the primary signal timeframe, including RSI and recent_candles. If the prompt says M15/15m, use snapshot.timeframes["15m"] as primary. Only use 1d/4h/1h as context if the prompt asks for them or if the prompt does not specify a lower timeframe. Do not reject a 5m RSI strategy merely because H1 is sideway/mixed.
 - If the strategy prompt does not clearly authorize a new trade, return WAIT. If the setup is valid but you cannot compute concrete stop_loss and take_profit prices, return WAIT with a reason naming at least 2 blockers instead of returning an opening action without TP/SL.
-- For strategy prompts using D1/H4/H1 + EMA/RSI/MACD/ATR, first inspect snapshot.timeframes["1d"], snapshot.timeframes["4h"], and snapshot.timeframes["1h"]. A good WAIT reason must mention which of these failed: D1/H4 trend, H1 pullback, candle confirmation, RSI zone, MACD confirmation, ATR/TP/SL calculation, R:R >= 1.5R, daily trade/risk limits, existing position.
+- For RSI lower-timeframe prompts such as "RSI 5m < 27 + 2 green candles => Long" or "RSI 5m > 66 + 2 red candles => Short", evaluate exactly that rule using snapshot.timeframes["5m"].indicators.rsi14 and snapshot.timeframes["5m"].recent_candles. If the RSI/candle sequence is not satisfied, return WAIT and state the exact 5m RSI value and candle colors. For D1/H4/H1 prompts, inspect those requested timeframes and mention which failed.
 - Do not invent market data. Use only the provided snapshot. Never output OPEN_LONG or OPEN_SHORT without stop_loss and take_profit when the prompt requires ATR/RR/structure exits. If timeframes.1h.structure has swing_low/swing_high/support/resistance and timeframes.1h.indicators has atr14, use them to calculate concrete stop_loss/take_profit and then check R:R before opening.
 """.strip()
 
@@ -798,7 +830,9 @@ def compact_kline_summary(klines: List[List[Any]]) -> Dict[str, Any]:
     rows = []
     for row in klines[:50]:
         try:
-            rows.append({"t": int(row[0]), "o": str(row[1]), "h": str(row[2]), "l": str(row[3]), "c": str(row[4]), "v": str(row[5])})
+            o = Decimal(str(row[1])); c = Decimal(str(row[4]))
+            color = "green" if c > o else "red" if c < o else "doji"
+            rows.append({"t": int(row[0]), "o": str(row[1]), "h": str(row[2]), "l": str(row[3]), "c": str(row[4]), "v": str(row[5]), "color": color})
         except Exception:
             continue
     closes = [Decimal(r["c"]) for r in rows if r.get("c")]
@@ -807,4 +841,10 @@ def compact_kline_summary(klines: List[List[Any]]) -> Dict[str, Any]:
     last = closes[0]
     oldest = closes[-1]
     change_pct = ((last - oldest) / oldest * Decimal("100")) if oldest else Decimal("0")
-    return {"recent_klines": rows[:20], "last_close": str(last), "change_pct_over_sample": str(change_pct.quantize(Decimal("0.01"))), "sample_size": len(rows)}
+    return {
+        "recent_klines": rows[:20],
+        "recent_candles": [{"t": r.get("t"), "o": r.get("o"), "c": r.get("c"), "color": r.get("color")} for r in rows[:8]],
+        "last_close": str(last),
+        "change_pct_over_sample": str(change_pct.quantize(Decimal("0.01"))),
+        "sample_size": len(rows),
+    }

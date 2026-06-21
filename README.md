@@ -1,50 +1,63 @@
-# CIG AI Subaccount Clean V44
+# CIG AI Subaccount Clean V48
 
-Bản V44 dọn lại live log để dashboard dễ đọc hơn sau khi tầng AI đã chạy ổn. Mặc định bot không còn in raw JSON snapshot/RAW AI response/PARSED SIGNAL ra Live Log. Các dòng đó chỉ hiện khi bật `AI_DEBUG_LOGS=true`.
+## Fix chính trong V48
 
-## Điểm mới V44
+### 1. Tách rõ 3 luồng lệnh
 
-- Live Log mặc định chỉ hiển thị các dòng ngắn:
-  - Bot bắt đầu chạy
-  - Bybit OK
-  - Tóm tắt thị trường theo D1 / H4 / H1 / 15m
-  - Quyết định AI: WAIT / OPEN_LONG / OPEN_SHORT
-  - Kết quả lệnh hoặc lý do bị Risk Guard chặn
-- Raw debug JSON được chuyển sang chế độ debug ẩn mặc định.
-- Thêm biến môi trường `AI_DEBUG_LOGS=false`. Khi cần điều tra lỗi, đổi thành `true` để hiện lại:
-  - `AI DEBUG · MARKET SNAPSHOT SENT TO AI`
-  - `AI DEBUG · RAW AI RESPONSE`
-  - `AI DEBUG · PARSED SIGNAL`
-- Xoá `__pycache__` khỏi gói clean.
+V48 tách riêng:
 
-## Cấu hình khuyến nghị
+- **Bot Control**: đổi prompt, đổi max leverage, đổi allowed symbols, bật/tắt dry-run.
+- **Strategy Prompt**: prompt chạy vòng lặp tự động.
+- **Direct Execution Command**: lệnh trực tiếp như `đóng hết lệnh future btc`, `long BTC 10u x20`, `mua spot BTC 20u`.
 
-```env
-OPENAI_MODEL=gpt-4o-mini
-OPENAI_FALLBACK_MODELS=gpt-4o-mini,gpt-4.1-mini
-AI_DEBUG_LOGS=false
+Trước V48, direct command có thể bị control parser hoặc AI strategy reasoning bắt nhầm.
+
+### 2. Direct Command không còn bị AI tự biên chiến lược
+
+Nếu câu lệnh là hành động trực tiếp rõ ràng, bot dùng parser nội bộ để tạo action, **không gọi AI**. Điều này tránh lỗi AI tự dùng D1/H4/H1, EMA, MACD hoặc prompt đang lưu để suy luận ngoài ý user.
+
+Ví dụ các câu sau được xử lý trực tiếp:
+
+```text
+đóng hết lệnh future btc
+close all btc future
+đóng short btc future
+đóng long btc
+long btc 10u x20 tp 10% sl 5%
+mua spot btc 20u
 ```
 
----
+### 3. Fix lỗi allowed_symbols/control bắt nhầm
 
-# CIG AI Subaccount Clean V43
+Những lệnh như:
 
-Bản V43 sửa tầng AI: ưu tiên strict function calling `submit_trading_signal`, fallback model chain (`OPENAI_FALLBACK_MODELS`), và deterministic recovery rõ lý do khi model trả `{}`.
+```text
+đóng hết lệnh future btc
+```
 
-# CIG AI Subaccount Clean V41
+sẽ không còn bị hiểu nhầm thành lệnh chỉnh `allowed_symbols` hoặc bot control.
 
-Bản V41 vá lỗi AI vẫn trả `{}` sau khi đổi prompt nới lỏng.
+### 4. Close futures chuẩn hơn
 
-## Sửa chính
+Các lệnh đóng vị thế:
 
-- Structured Output chuyển sang schema strict hơn, bắt buộc có `action` và `reason`.
-- Nếu AI vẫn trả `{}`, bot retry bằng payload rút gọn chỉ tập trung `linear:BTCUSDT`, không gửi lại toàn bộ prompt dài.
-- Retry bắt buộc trả một trong: `WAIT`, `OPEN_LONG`, `OPEN_SHORT`.
-- Nếu mở lệnh, bắt buộc có `stop_loss`, `take_profit`, `margin_usdt=8`, `risk_usdt=1`, `leverage=10`.
-- Nếu không đủ điều kiện, trả `WAIT` với ít nhất 2 lý do cụ thể từ snapshot.
-- Vẫn không dùng TP/SL mặc định khi prompt yêu cầu TP/SL theo ATR/RR/structure.
+```text
+đóng hết lệnh future btc
+đóng long btc
+đóng short btc
+```
 
-## Test cần thấy
+sẽ map thành:
 
-`AI DEBUG · RAW AI RESPONSE` không nên còn là `{}`.  
-Nếu setup chưa đủ, raw response nên là JSON `WAIT` có reason chi tiết.
+```json
+CLOSE_ALL / CLOSE_LONG / CLOSE_SHORT
+category: linear
+symbol: BTCUSDT
+```
+
+## Ghi chú deploy Railway
+
+- Dockerfile nằm ngay root.
+- Không kèm database runtime thật.
+- Giữ nguyên cấu trúc FastAPI cũ.
+- Nếu đang chạy Railway Volume `/data`, không xoá `/data/app.db` khi deploy.

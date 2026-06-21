@@ -69,8 +69,9 @@ def _parse_interval_seconds(ascii_text: str) -> tuple[Optional[int], str]:
     ]
     patterns = [
         r'(?:moi|cu\s*moi|every|each)\s*(\d+(?:\.\d+)?)\s*(giay|phut|tieng|gio|hour|hours|hr|hrs|minute|minutes|min|mins|second|seconds|sec|secs|day|days|ngay|h|m|s|d)\b',
+        r'(?:vong\s*lap|loop|quet|scan|chu\s*ky)[^\n]{0,40}?(?:sau\s*moi|moi|every|each)\s*(\d+(?:\.\d+)?)\s*(giay|phut|tieng|gio|hour|hours|hr|hrs|minute|minutes|min|mins|second|seconds|sec|secs|day|days|ngay|h|m|s|d)\b',
         r'lap\s*lai\s*sau\s*(\d+(?:\.\d+)?)\s*(giay|phut|tieng|gio|hour|hours|minute|minutes|day|days|ngay|h|m|s|d)\b',
-        r'chu\s*ky\s*(\d+(?:\.\d+)?)\s*(giay|phut|tieng|gio|hour|hours|minute|minutes|day|days|ngay|h|m|s|d)\b',
+        r'chu\s*ky\s*(?:quet|scan|bot|chien\s*luoc)?\s*(\d+(?:\.\d+)?)\s*(giay|phut|tieng|gio|hour|hours|minute|minutes|day|days|ngay|h|m|s|d)\b',
         *shorthand_patterns,
     ]
     for pattern in patterns:
@@ -101,12 +102,12 @@ def _parse_timeframe(ascii_text: str) -> str:
 
     def add(raw: str) -> None:
         raw = raw.upper()
-        aliases = {'D1': '1D', '1D': '1D', 'H4': '4H', '4H': '4H', 'H1': '1H', '1H': '1H', 'M30': '30M', '30M': '30M', 'M15': '15M', '15M': '15M'}
+        aliases = {'D1': '1D', '1D': '1D', 'H4': '4H', '4H': '4H', 'H1': '1H', '1H': '1H', 'M30': '30M', '30M': '30M', 'M15': '15M', '15M': '15M', 'M5': '5M', '5M': '5M'}
         tf = aliases.get(raw, raw)
         if tf not in found:
             found.append(tf)
 
-    for raw in re.findall(r'\b(?:d1|1d|h4|4h|h1|1h|m30|30m|m15|15m)\b', ascii_text, flags=re.IGNORECASE):
+    for raw in re.findall(r'\b(?:d1|1d|h4|4h|h1|1h|m30|30m|m15|15m|m5|5m)\b', ascii_text, flags=re.IGNORECASE):
         add(raw)
 
     patterns = [
@@ -119,7 +120,7 @@ def _parse_timeframe(ascii_text: str) -> str:
             add(f'{a}{b}' if a.isdigit() else f'{b}{a}')
 
     if found:
-        order = ['1D', '4H', '1H', '30M', '15M']
+        order = ['1D', '4H', '1H', '30M', '15M', '5M']
         found = sorted(found, key=lambda x: order.index(x) if x in order else 99)
         return '/'.join(found[:4])
     return ''
@@ -151,16 +152,36 @@ def parse_strategy_prompt(prompt: str, allowed_symbols: Optional[List[str]] = No
         'requires_explicit_tp_sl': False,
         'rsi_rules': [],
         'indicators': [],
+        'primary_timeframe': '',
+        'strict_prompt_only': False,
+        'prompt_only_mode': False,
+        'allowed_timeframes': [],
+        'allowed_indicators': [],
+        'exact_rsi_candle_strategy': False,
+        'rsi_long_below': None,
+        'rsi_short_above': None,
+        'candle_confirm_count': None,
     }
 
     interval_seconds, interval_label = _parse_interval_seconds(ascii_text)
     out['interval_seconds'] = interval_seconds
     out['interval_label'] = interval_label
     out['timeframe'] = _parse_timeframe(ascii_text)
+    tf_text = str(out.get('timeframe') or '').upper()
+    if '5M' in tf_text:
+        out['primary_timeframe'] = '5m'
+    elif '15M' in tf_text:
+        out['primary_timeframe'] = '15m'
+    elif '1H' in tf_text:
+        out['primary_timeframe'] = '1h'
+    elif '4H' in tf_text:
+        out['primary_timeframe'] = '4h'
+    elif '1D' in tf_text:
+        out['primary_timeframe'] = '1d'
 
     if any(k in ascii_text for k in ['spot', 'giao ngay', 'nam giu', 'hold coin']):
         out['market'] = 'spot'
-    elif any(k in ascii_text for k in ['future', 'futures', 'hop dong', 'perp', 'perpetual', 'long', 'short', 'don bay', 'leverage']):
+    elif any(k in ascii_text for k in ['future', 'futures', 'hop dong', 'perp', 'perpetual', 'long', 'short', 'don bay', 'donbay', 'bay x', 'bayx', 'leverage']):
         out['market'] = 'linear'
 
     lev_patterns = [
@@ -175,6 +196,10 @@ def parse_strategy_prompt(prompt: str, allowed_symbols: Optional[List[str]] = No
             if num and num > 0:
                 out['leverage'] = int(num)
                 break
+
+    if out.get('leverage') and not out.get('market'):
+        # A prompt that uses leverage/x20 is a derivatives/futures prompt unless it explicitly says spot.
+        out['market'] = 'linear'
 
     def _extract_money_with_context(text_original: str) -> list[tuple[str, str]]:
         results: list[tuple[str, str]] = []
@@ -208,12 +233,16 @@ def parse_strategy_prompt(prompt: str, allowed_symbols: Optional[List[str]] = No
             r'margin\s*(?:moi\s*lenh|cho\s*moi\s*lenh|lenh)',
             r'ky\s*quy\s*(?:moi\s*lenh|cho\s*moi\s*lenh|lenh)?',
             r'order\s*margin',
+            r'von\s*(?:moi\s*lenh|cho\s*moi\s*lenh|lenh)',
+            r'vốn\s*(?:mỗi\s*lệnh|cho\s*mỗi\s*lệnh|lệnh)',
         ]
         labels_after = [
             r'margin_usdt',
             r'margin\s*futures',
             r'margin\s*(?:moi\s*lenh|cho\s*moi\s*lenh|lenh)',
             r'ky\s*quy\s*(?:moi\s*lenh|cho\s*moi\s*lenh|lenh)?',
+            r'von\s*(?:moi\s*lenh|cho\s*moi\s*lenh|lenh)',
+            r'vốn\s*(?:mỗi\s*lệnh|cho\s*mỗi\s*lệnh|lệnh)',
         ]
         for label in labels_before:
             pattern = rf'\b(?:{label})\b\s*(?:=|:|la|là|mac\s*dinh|default|dung|su\s*dung|use)?\s*{amount}\s*{money}\b'
@@ -275,14 +304,14 @@ def parse_strategy_prompt(prompt: str, allowed_symbols: Optional[List[str]] = No
     # This prevents strategy text like "take-profit 1.5R" or "1.2 ATR"
     # from being misread as TP 1.5% / TP 1.2%.
     out['take_profit_pct'] = _parse_pct([
-        r'\btp\s*[:=]?\s*(\d+(?:[\.,]\d+)?)\s*(?:%|phan\s*tram|percent)\b',
-        r'take\s*profit\s*[:=]?\s*(\d+(?:[\.,]\d+)?)\s*(?:%|phan\s*tram|percent)\b',
-        r'chot\s*loi\s*[:=]?\s*(\d+(?:[\.,]\d+)?)\s*(?:%|phan\s*tram|percent)\b',
+        r'\btp\s*[:=]?\s*(\d+(?:[\.,]\d+)?)\s*(?:%|phan\s*tram\b|percent\b)',
+        r'take\s*profit\s*[:=]?\s*(\d+(?:[\.,]\d+)?)\s*(?:%|phan\s*tram\b|percent\b)',
+        r'chot\s*loi\s*[:=]?\s*(\d+(?:[\.,]\d+)?)\s*(?:%|phan\s*tram\b|percent\b)',
     ], ascii_text)
     out['stop_loss_pct'] = _parse_pct([
-        r'\bsl\s*[:=]?\s*(\d+(?:[\.,]\d+)?)\s*(?:%|phan\s*tram|percent)\b',
-        r'stop\s*loss\s*[:=]?\s*(\d+(?:[\.,]\d+)?)\s*(?:%|phan\s*tram|percent)\b',
-        r'cat\s*lo\s*[:=]?\s*(\d+(?:[\.,]\d+)?)\s*(?:%|phan\s*tram|percent)\b',
+        r'\bsl\s*[:=]?\s*(\d+(?:[\.,]\d+)?)\s*(?:%|phan\s*tram\b|percent\b)',
+        r'stop\s*loss\s*[:=]?\s*(\d+(?:[\.,]\d+)?)\s*(?:%|phan\s*tram\b|percent\b)',
+        r'cat\s*lo\s*[:=]?\s*(\d+(?:[\.,]\d+)?)\s*(?:%|phan\s*tram\b|percent\b)',
     ], ascii_text)
 
     # Strategy TP/SL mode. If the user describes ATR/R-multiple/structure exits,
@@ -307,13 +336,67 @@ def parse_strategy_prompt(prompt: str, allowed_symbols: Optional[List[str]] = No
         if key in ascii_text:
             indicators.append(key.upper())
     out['indicators'] = list(dict.fromkeys(indicators))
+    out['allowed_indicators'] = list(out['indicators'])
+
+    # V47 Prompt-Only Mode:
+    # If the user explicitly names indicators/timeframe, the app must not inject
+    # unmentioned strategy logic into the AI decision. Example: "RSI 5m 66-21"
+    # must be evaluated with RSI on 5m only, not D1/H4/H1 EMA/MACD.
+    if out.get('primary_timeframe'):
+        out['allowed_timeframes'] = [out['primary_timeframe']]
+    elif out.get('timeframe'):
+        tf_map = {'5M':'5m','15M':'15m','30M':'30m','1H':'1h','4H':'4h','1D':'1d'}
+        out['allowed_timeframes'] = [tf_map[x] for x in str(out.get('timeframe')).upper().split('/') if x in tf_map]
+    indicator_words = ['rsi','ema','macd','atr','volume','vol','bollinger','bb','sma','vwap']
+    if out.get('allowed_timeframes') or any(k in ascii_text for k in indicator_words):
+        out['prompt_only_mode'] = True
+        out['strict_prompt_only'] = True
+
+    # Parse common Vietnamese RSI shorthand: "quá mua/quá bán ở 66-21",
+    # "RSI oversold 21 overbought 66", etc. High number = overbought/short,
+    # low number = oversold/long when both terms appear.
+    if 'rsi' in ascii_text and any(term in ascii_text for term in ['qua mua','qua ban','overbought','oversold']):
+        nums = []
+        window_match = re.search(r'rsi[^\n]{0,120}', ascii_text)
+        window = window_match.group(0) if window_match else ascii_text
+        for raw in re.findall(r'\b(\d{1,3}(?:\.\d+)?)\b', window):
+            val = _num_or_none(raw)
+            if val is not None and 0 <= val <= 100:
+                nums.append(val)
+        if 'qua mua' in ascii_text or 'overbought' in ascii_text:
+            m = re.search(r'(?:qua\s*mua|overbought)[^0-9]{0,30}(\d{1,3}(?:\.\d+)?)', ascii_text)
+            if m:
+                out['rsi_short_above'] = _num_or_none(m.group(1))
+        if 'qua ban' in ascii_text or 'oversold' in ascii_text:
+            m = re.search(r'(?:qua\s*ban|oversold)[^0-9]{0,30}(\d{1,3}(?:\.\d+)?)', ascii_text)
+            if m:
+                out['rsi_long_below'] = _num_or_none(m.group(1))
+        if len(nums) >= 2 and ('qua mua' in ascii_text or 'overbought' in ascii_text) and ('qua ban' in ascii_text or 'oversold' in ascii_text):
+            # In shorthand like "quá mua/quá bán 66-21", use the explicit pair
+            # first. Do not let unrelated numbers such as 10 USDT or x20 become RSI thresholds.
+            pair = re.search(r'\b(\d{1,3}(?:\.\d+)?)\s*[-/]\s*(\d{1,3}(?:\.\d+)?)\b', window)
+            if pair:
+                a = _num_or_none(pair.group(1)); b = _num_or_none(pair.group(2))
+                vals = [x for x in (a, b) if x is not None and 0 <= x <= 100]
+            else:
+                current_low = out.get('rsi_long_below')
+                current_high = out.get('rsi_short_above')
+                if current_low is not None and current_high is not None and 10 <= float(current_low) <= 45 and 55 <= float(current_high) <= 90:
+                    vals = [float(current_high), float(current_low)]
+                else:
+                    lows = [x for x in nums if 10 <= x <= 45]
+                    highs = [x for x in nums if 55 <= x <= 90]
+                    vals = ([max(highs)] if highs else []) + ([min(lows)] if lows else [])
+            if len(vals) >= 2:
+                out['rsi_short_above'] = max(vals)
+                out['rsi_long_below'] = min(vals)
 
     rsi_rules = []
     rsi_patterns = [
-        r'rsi\s*(?:<|duoi|below|under)\s*(\d+(?:\.\d+)?)',
-        r'rsi\s*(?:>|tren|above|over)\s*(\d+(?:\.\d+)?)',
-        r'rsi\s*(?:<=|nho\s*hon\s*hoac\s*bang)\s*(\d+(?:\.\d+)?)',
-        r'rsi\s*(?:>=|lon\s*hon\s*hoac\s*bang)\s*(\d+(?:\.\d+)?)',
+        r'rsi[^0-9<>]{0,50}(?:<|duoi|nho\s*hon|below|under)\s*(\d+(?:\.\d+)?)',
+        r'rsi[^0-9<>]{0,50}(?:>|tren|lon\s*hon|above|over)\s*(\d+(?:\.\d+)?)',
+        r'rsi[^0-9<>]{0,50}(?:<=|nho\s*hon\s*hoac\s*bang)\s*(\d+(?:\.\d+)?)',
+        r'rsi[^0-9<>]{0,50}(?:>=|lon\s*hon\s*hoac\s*bang)\s*(\d+(?:\.\d+)?)',
     ]
     for p in rsi_patterns:
         m = re.search(p, ascii_text, flags=re.IGNORECASE)
@@ -321,6 +404,52 @@ def parse_strategy_prompt(prompt: str, allowed_symbols: Optional[List[str]] = No
             snippet = re.search(r'rsi[^\n,;]{0,40}', ascii_text)
             rsi_rules.append((snippet.group(0) if snippet else f'RSI {m.group(1)}').strip())
     out['rsi_rules'] = list(dict.fromkeys(rsi_rules))
+
+    # Generic RSI threshold extraction for prompts such as:
+    # "RSI nhỏ hơn 27 thì Long" / "RSI lớn hơn 66 thì Short".
+    lm = re.search(r'rsi[^\n]{0,90}(?:<|duoi|nho\s*hon|below|under)\s*(\d+(?:\.\d+)?)', ascii_text, flags=re.IGNORECASE)
+    sm = re.search(r'rsi[^\n]{0,90}(?:>|tren|lon\s*hon|above|over)\s*(\d+(?:\.\d+)?)', ascii_text, flags=re.IGNORECASE)
+    if lm and out.get('rsi_long_below') is None:
+        out['rsi_long_below'] = _num_or_none(lm.group(1))
+    if sm and out.get('rsi_short_above') is None:
+        out['rsi_short_above'] = _num_or_none(sm.group(1))
+
+    # Candle confirmation directives for low-timeframe RSI strategies, e.g.
+    # "RSI 5m < 27 + 2 nến xanh thì Long".
+    candle_rules = []
+    if any(term in ascii_text for term in ['2 cay nen', 'hai cay nen', '2 nen', 'hai nen']):
+        if any(term in ascii_text for term in ['xanh', 'green']):
+            candle_rules.append('2_green_candles')
+        if any(term in ascii_text for term in ['do', 'red']):
+            candle_rules.append('2_red_candles')
+    if candle_rules:
+        out['candle_rules'] = candle_rules
+
+    # Strict low-timeframe RSI+candle strategies must not be rewritten by any
+    # default D1/H4/H1 strategy prompt. Example: "RSI 5m < 27 + 2 green candles => Long; RSI 5m > 66 + 2 red candles => Short".
+    # When this is detected, execution code uses only 5m RSI + candle colors;
+    # unmentioned EMA/MACD/D1/H4/H1 data can be logged but must not authorize a trade.
+    low_tf_rsi = (('5m' in ascii_text or 'm5' in ascii_text or '5 phut' in ascii_text or 'khung thoi gian 5' in ascii_text) and 'rsi' in ascii_text)
+    two_candle = any(term in ascii_text for term in ['2 cay', '2 nen', 'hai cay', 'hai nen'])
+    if low_tf_rsi and two_candle:
+        long_match = re.search(r'rsi[^\n]{0,90}(?:<|duoi|nho\s*hon|below|under)\s*(\d+(?:\.\d+)?)[^\n]{0,160}(?:xanh|green)[^\n]{0,160}(?:long|mua)', ascii_text, flags=re.IGNORECASE)
+        if not long_match:
+            long_match = re.search(r'(?:long|mua)[^\n]{0,160}rsi[^\n]{0,90}(?:<|duoi|nho\s*hon|below|under)\s*(\d+(?:\.\d+)?)', ascii_text, flags=re.IGNORECASE)
+        short_match = re.search(r'rsi[^\n]{0,90}(?:>|tren|lon\s*hon|above|over)\s*(\d+(?:\.\d+)?)[^\n]{0,160}(?:do|red)[^\n]{0,160}(?:short|ban)', ascii_text, flags=re.IGNORECASE)
+        if not short_match:
+            short_match = re.search(r'(?:short|ban)[^\n]{0,160}rsi[^\n]{0,90}(?:>|tren|lon\s*hon|above|over)\s*(\d+(?:\.\d+)?)', ascii_text, flags=re.IGNORECASE)
+        if long_match:
+            out['rsi_long_below'] = _num_or_none(long_match.group(1))
+        if short_match:
+            out['rsi_short_above'] = _num_or_none(short_match.group(1))
+        if long_match or short_match or out.get('rsi_long_below') is not None or out.get('rsi_short_above') is not None:
+            out['exact_rsi_candle_strategy'] = True
+            out['strict_prompt_only'] = True
+            out['prompt_only_mode'] = True
+            out['primary_timeframe'] = out.get('primary_timeframe') or '5m'
+            out['allowed_timeframes'] = ['5m']
+            out['allowed_indicators'] = ['RSI']
+            out['candle_confirm_count'] = 2
     return out
 
 
@@ -354,4 +483,8 @@ def summarize_strategy_directives(meta: Dict[str, Any]) -> str:
         parts.append('RSI: ' + '; '.join(meta['rsi_rules'][:2]))
     if meta.get('indicators'):
         parts.append('Chỉ báo: ' + ', '.join(meta['indicators'][:5]))
+    if meta.get('prompt_only_mode'):
+        tfs = ','.join(meta.get('allowed_timeframes') or []) or (meta.get('primary_timeframe') or '-')
+        inds = ','.join(meta.get('allowed_indicators') or []) or '-'
+        parts.append(f'Prompt-only: chỉ dùng {tfs} / {inds}')
     return ' · '.join(parts) if parts else 'Prompt đã lưu nhưng chưa bóc tách được nhiều chỉ dẫn cấu trúc. AI vẫn sẽ đọc nguyên prompt khi phân tích.'
