@@ -237,6 +237,9 @@ def summarize_trade_result(result: Dict[str, Any]) -> str:
     entry_txt = f" · giá tham chiếu {_short_number(entry)}" if entry else ""
     tp = f" · TP {_short_number(n.get('take_profit'))}" if n.get("take_profit") else ""
     sl = f" · SL {_short_number(n.get('stop_loss'))}" if n.get("stop_loss") else ""
+    if n.get("tp_sl_pct_mode") == "pnl":
+        tp += " (PNL%)" if tp else ""
+        sl += " (PNL%)" if sl else ""
     reason = str(n.get("reason") or "")[:180]
     reason_txt = f" · lý do: {reason}" if reason else ""
     return f"{action_label(action)} {symbol} ({category}) · {mode}{size}{lev}{entry_txt}{tp}{sl}{reason_txt}"
@@ -2027,10 +2030,77 @@ async def tracked_trades(user: Dict[str, Any] = Depends(current_user)) -> Dict[s
 
 @app.post("/api/trades/{trade_id}/close")
 async def close_tracked_trade(trade_id: int, user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
+    """Close the real Bybit position represented by one tracker row.
+
+    Older versions only changed local status to closed. V49 turns the table button
+    into a real close action: for futures it sends a reduceOnly market close for
+    the tracked qty/side; if qty is missing it closes the whole symbol side.
+    """
     runtime = runtimes.get(user["id"])
-    store.update_tracked_trade_status(user["id"], trade_id, "closed")
-    await runtime.log("INFO", f"Đã đóng thủ công lệnh theo dõi #{trade_id}.")
-    return {"ok": True}
+    row = store.get_tracked_trade(user["id"], trade_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Không tìm thấy lệnh theo dõi.")
+    if str(row.get("status") or "").lower() != "open":
+        return {"ok": True, "status": "already_closed"}
+
+    ws = get_workspace(user["id"], redact=False)
+    settings = ws["settings"]
+    client = make_client(settings)
+    guard = make_risk_guard(settings, runtime)
+
+    symbol = str(row.get("symbol") or "").upper().strip()
+    category = str(row.get("category") or "linear").lower().strip()
+    side = str(row.get("side") or "").lower().strip()
+    qty = str(row.get("qty") or "").strip()
+
+    if not symbol:
+        raise HTTPException(status_code=400, detail="Lệnh theo dõi thiếu symbol.")
+
+    current_price = str(row.get("current_price") or "")
+    try:
+        ticker = await client.get_ticker(symbol, category) if client.is_configured else {}
+        current_price = str(ticker.get("lastPrice") or ticker.get("markPrice") or current_price)
+    except Exception:
+        pass
+
+    if guard.config.dry_run:
+        store.update_tracked_trade_status(user["id"], trade_id, "closed", current_price=current_price)
+        await runtime.log("INFO", f"DRY_RUN: đã đóng theo dõi #{trade_id} ({symbol}) nhưng không gửi lệnh lên Bybit.")
+        return {"ok": True, "status": "dry_run_closed_tracker_only"}
+
+    if not client.is_configured:
+        raise HTTPException(status_code=400, detail="Thiếu Bybit API key/secret nên không thể đóng lệnh live.")
+
+    try:
+        if category in {"linear", "inverse"}:
+            target = "long" if side == "long" else "short" if side == "short" else "all"
+            if qty:
+                data = await client.close_position_qty(symbol=symbol, target=target, qty=qty, category=category)
+            else:
+                data = await client.close_position(symbol=symbol, target=target, category=category)
+            store.update_tracked_trade_status(user["id"], trade_id, "closed", current_price=current_price)
+            await runtime.log("WARN", f"Đã gửi Bybit đóng lệnh #{trade_id}: {symbol} {side or target} · qty {qty or 'full'} · reduceOnly market.")
+            return {"ok": True, "status": "live_close_sent", "bybit": data}
+
+        if category == "spot":
+            if not qty:
+                store.update_tracked_trade_status(user["id"], trade_id, "closed", current_price=current_price)
+                await runtime.log("WARN", f"Spot #{trade_id} thiếu qty; chỉ đóng theo dõi, không gửi lệnh bán lên Bybit.")
+                return {"ok": True, "status": "closed_tracker_only_no_spot_qty"}
+            data = await client.spot_market_sell(symbol=symbol, qty=qty)
+            store.update_tracked_trade_status(user["id"], trade_id, "closed", current_price=current_price)
+            await runtime.log("WARN", f"Đã gửi Bybit bán Spot để đóng lệnh #{trade_id}: {symbol} · qty {qty}.")
+            return {"ok": True, "status": "live_spot_sell_sent", "bybit": data}
+
+        raise HTTPException(status_code=400, detail=f"Category không hỗ trợ đóng từ bảng: {category}")
+    except BybitAPIError as exc:
+        msg = str(exc)
+        if "Không có position" in msg or ("position" in msg.lower() and "no" in msg.lower()):
+            store.update_tracked_trade_status(user["id"], trade_id, "closed", current_price=current_price)
+            await runtime.log("WARN", f"Bybit không còn position cho lệnh #{trade_id}; đã đóng theo dõi.")
+            return {"ok": True, "status": "bybit_no_position_closed_tracker", "error": msg}
+        await runtime.log("ERROR", f"Đóng lệnh #{trade_id} thất bại: {msg}")
+        raise HTTPException(status_code=400, detail=msg)
 
 
 @app.post("/api/trades/clear-closed")

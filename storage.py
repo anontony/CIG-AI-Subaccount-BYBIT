@@ -358,6 +358,15 @@ class UserStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+
+    def get_tracked_trade(self, user_id: int, trade_id: int) -> Dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM tracked_trades WHERE user_id=? AND id=?",
+                (user_id, int(trade_id)),
+            ).fetchone()
+        return dict(row) if row else None
+
     def update_tracked_trade_status(self, user_id: int, trade_id: int, status: str, current_price: str = "") -> None:
         now = int(time.time())
         with self._connect() as conn:

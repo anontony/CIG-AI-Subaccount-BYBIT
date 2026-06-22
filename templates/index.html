@@ -336,7 +336,7 @@ Ví dụ: đổi prompt thành: Chỉ trade BTCUSDT khi xu hướng rõ."></text
                 <div class="trade-watch-head">
                   <div>
                     <h3>Theo dõi lệnh</h3>
-                    <p>Hiển thị lệnh mô phỏng/lệnh thật theo user hiện tại, gồm PNL %, TP/SL và trạng thái chạm TP/SL.</p>
+                    <p>Hiển thị lệnh mô phỏng/lệnh thật theo user hiện tại, gồm PNL %, TP/SL theo PNL futures và trạng thái chạm TP/SL.</p>
                   </div>
                   <div class="trade-actions">
                     <button class="trade-tool-btn" onclick="loadTrades()">↻ Làm mới</button>
@@ -434,8 +434,8 @@ Ví dụ: đổi prompt thành: Chỉ trade BTCUSDT khi xu hướng rõ."></text
             <div class="field"><label>Giá trị vị thế tối đa (USDT)</label><input id="max_notional_usdt" value="100" /></div>
             <div class="field"><label>Số lệnh tối đa mỗi ngày</label><input id="max_daily_trades" type="number" min="1" value="5" /></div>
             <div class="field"><label>Cooldown chống spam (đã tắt, để 0)</label><input id="min_seconds_between_trades" type="number" min="0" value="0" /></div>
-            <div class="field"><label>TP mặc định (%)</label><input id="default_take_profit_pct" value="1.2" placeholder="Ví dụ: 1.2" /></div>
-            <div class="field"><label>SL mặc định (%)</label><input id="default_stop_loss_pct" value="0.6" placeholder="Ví dụ: 0.6" /></div>
+            <div class="field"><label>TP mặc định (% PNL futures / % giá spot)</label><input id="default_take_profit_pct" value="1.2" placeholder="Ví dụ: 1.2" /></div>
+            <div class="field"><label>SL mặc định (% PNL futures / % giá spot)</label><input id="default_stop_loss_pct" value="0.6" placeholder="Ví dụ: 0.6" /></div>
             <div class="toggle-row"><div><b>Bắt buộc TP/SL</b><div class="mini">Nếu lệnh không ghi TP/SL, bot dùng TP/SL mặc định ở trên.</div></div><input id="require_tp_sl" type="checkbox" checked /></div>
             <div class="toggle-row"><div><b>Bật mô phỏng / DRY_RUN</b><div class="mini">Bật = giả lập. Tắt = gửi lệnh thật nếu API có quyền Trade.</div></div><input id="dry_run" type="checkbox" checked /></div>
             <div class="toggle-row"><div><b>Tiết kiệm token AI</b><div class="mini">Bật = lệnh rõ ràng và DCA đơn giản sẽ dùng parser/rule trước, chỉ gọi AI khi thật sự cần phân tích.</div></div><input id="ai_cost_saver" type="checkbox" checked /></div>
@@ -803,7 +803,7 @@ async function loadTrades() {
         <td><span class="${pnlClass(pnl)}">${pnl !== null && pnl !== undefined ? fmt(pnl) + '%' : '-'}</span><div class="trade-mini">Ước tính ${fmt(p.pnl_usdt_est)} USDT</div></td>
         <td>TP ${fmt(t.take_profit)}<br>SL ${fmt(t.stop_loss)}<div class="trade-mini">Cách TP ${fmt(p.distance_to_tp_pct)}% · Cách SL ${fmt(p.distance_to_sl_pct)}%</div></td>
         <td>${stateLabel(p.tp_sl_state, t.status)}<div class="trade-mini">${t.source === 'dry_run' ? 'Mô phỏng' : 'Bybit live'} · #${t.id}</div></td>
-        <td>${t.status === 'open' ? `<button class="row-action-btn" onclick="closeTrackedTrade(${t.id})">Đóng theo dõi</button>` : ''}</td>
+        <td>${t.status === 'open' ? `<button class="row-action-btn" onclick="closeTrackedTrade(${t.id})">Đóng lệnh</button>` : ''}</td>
       </tr>`;
     }).join('');
   } catch(e) { handleError(e, 'Không tải được bảng theo dõi lệnh'); }
@@ -812,7 +812,7 @@ async function closeTrackedTrade(id) {
   try {
     await api('/api/trades/' + id + '/close', { method:'POST' });
     await loadTrades();
-  } catch(e) { handleError(e, 'Không đóng được lệnh theo dõi'); }
+  } catch(e) { handleError(e, 'Không đóng được lệnh trên Bybit'); }
 }
 async function clearClosedTrades() {
   try {
@@ -905,7 +905,7 @@ async function refreshStatus() {
     <div class="stat"><span class="mini">Kiểu ký Bybit</span><b>${data.bybit_signing || '-'}</b></div>
     <div class="stat"><span class="mini">Đòn bẩy tối đa</span><b>${data.risk.max_leverage}x</b></div>
     <div class="stat"><span class="mini">Vốn tối đa/lệnh</span><b>${data.risk.max_margin_per_trade_usdt} USDT</b></div>
-    <div class="stat"><span class="mini">TP/SL mặc định</span><b>TP ${data.risk.default_take_profit_pct}% / SL ${data.risk.default_stop_loss_pct}%</b></div>
+    <div class="stat"><span class="mini">TP/SL mặc định</span><b>TP ${data.risk.default_take_profit_pct}% PNL / SL ${data.risk.default_stop_loss_pct}% PNL</b></div>
     <div class="stat"><span class="mini">Model AI</span><b>${data.openai_model || '-'}</b></div>
     <div class="stat"><span class="mini">Lệnh hôm nay</span><b>${data.daily_trade_count}/${data.risk.max_daily_trades}</b></div>
     <div class="stat"><span class="mini">Prompt</span><b>${data.prompt_exists ? 'Đã lưu' : 'Chưa có'}</b></div>

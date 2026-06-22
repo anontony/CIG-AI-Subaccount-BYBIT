@@ -335,6 +335,68 @@ class BybitClient:
             )
         return {"retCode": 0, "retMsg": "OK", "result": results}
 
+    async def close_position_qty(self, *, symbol: str, target: str, qty: str, category: str = "linear") -> Dict[str, Any]:
+        """Close a specific quantity for the current futures position side.
+
+        This is used by the dashboard row-level "Đóng lệnh" button. Bybit futures
+        positions are netted by symbol/side, so the closest safe behavior is a
+        reduceOnly market close for the tracked row quantity. If tracked qty is
+        greater than the live position size, only the live size is closed.
+        """
+        data = await self.get_positions(symbol, category)
+        items = data.get("result", {}).get("list", [])
+        target = target.lower()
+        requested_qty = Decimal(str(qty or "0"))
+        if requested_qty <= 0:
+            return await self.close_position(symbol=symbol, target=target, category=category)
+
+        matching = []
+        for pos in items:
+            size = Decimal(str(pos.get("size") or "0"))
+            if size <= 0:
+                continue
+            idx = int(pos.get("positionIdx") or 0)
+            pos_side = str(pos.get("side") or "").lower()
+            if target == "long" and (pos_side == "buy" or idx == 1):
+                matching.append(pos)
+            elif target == "short" and (pos_side == "sell" or idx == 2):
+                matching.append(pos)
+            elif target == "all":
+                matching.append(pos)
+
+        if not matching:
+            raise BybitAPIError(f"Không có position {target} đang mở cho {symbol}.")
+
+        results = []
+        remaining = requested_qty
+        for pos in matching:
+            if remaining <= 0:
+                break
+            idx = int(pos.get("positionIdx") or 0)
+            pos_side = str(pos.get("side") or "").lower()
+            size = Decimal(str(pos.get("size") or "0"))
+            close_qty = remaining if remaining <= size else size
+            if close_qty <= 0:
+                continue
+            close_side = "Sell" if pos_side == "buy" or idx == 1 else "Buy"
+            results.append(
+                await self.place_order(
+                    {
+                        "category": category,
+                        "symbol": symbol,
+                        "side": close_side,
+                        "orderType": "Market",
+                        "qty": format(close_qty.normalize(), "f"),
+                        "timeInForce": "IOC",
+                        "reduceOnly": True,
+                        "positionIdx": idx,
+                    }
+                )
+            )
+            remaining -= close_qty
+
+        return {"retCode": 0, "retMsg": "OK", "result": results, "closed_qty_requested": str(requested_qty), "remaining_not_closed": str(remaining)}
+
 
     async def get_spot_base_balance(self, symbol: str) -> Decimal:
         """Return available base coin balance for a spot pair like BTCUSDT."""

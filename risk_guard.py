@@ -156,11 +156,24 @@ class RiskGuard:
         }
         return aliases.get(action, action)
 
-    def _apply_default_tp_sl(self, raw: str, take_profit: Optional[Decimal], stop_loss: Optional[Decimal], market_price: Decimal) -> tuple[Optional[Decimal], Optional[Decimal]]:
+    def _pnl_pct_to_price_fraction(self, raw: str, pnl_pct: Decimal, leverage: int) -> Decimal:
+        """Convert a user TP/SL percentage to a price-move fraction.
+
+        For futures, users expect `TP 10%` / `SL 5%` to mean ROI/PNL on margin,
+        not a 10% BTC price move. Example: 20x + TP 10% => price move 0.5%.
+        For spot, percentage remains normal price percentage.
+        """
+        pct = pnl_pct / Decimal("100")
+        if raw in {"OPEN_LONG", "OPEN_SHORT"}:
+            lev = Decimal(max(int(leverage or 1), 1))
+            return pct / lev
+        return pct
+
+    def _apply_default_tp_sl(self, raw: str, take_profit: Optional[Decimal], stop_loss: Optional[Decimal], market_price: Decimal, leverage: int = 1) -> tuple[Optional[Decimal], Optional[Decimal]]:
         if raw not in {"OPEN_LONG", "OPEN_SHORT", "SPOT_BUY"}:
             return take_profit, stop_loss
-        tp_pct = self.config.default_take_profit_pct / Decimal("100")
-        sl_pct = self.config.default_stop_loss_pct / Decimal("100")
+        tp_pct = self._pnl_pct_to_price_fraction(raw, self.config.default_take_profit_pct, leverage)
+        sl_pct = self._pnl_pct_to_price_fraction(raw, self.config.default_stop_loss_pct, leverage)
         if take_profit is None and tp_pct > 0:
             take_profit = market_price * (Decimal("1") + tp_pct) if raw in {"OPEN_LONG", "SPOT_BUY"} else market_price * (Decimal("1") - tp_pct)
         if stop_loss is None and sl_pct > 0:
@@ -190,16 +203,16 @@ class RiskGuard:
         return
 
 
-    def _apply_explicit_tp_sl_pct(self, raw: str, action: Dict[str, Any], market_price: Decimal) -> tuple[Optional[Decimal], Optional[Decimal]]:
+    def _apply_explicit_tp_sl_pct(self, raw: str, action: Dict[str, Any], market_price: Decimal, leverage: int = 1) -> tuple[Optional[Decimal], Optional[Decimal]]:
         tp_pct = self._decimal(action.get("take_profit_pct"), "take_profit_pct", required=False)
         sl_pct = self._decimal(action.get("stop_loss_pct"), "stop_loss_pct", required=False)
         tp = None
         sl = None
         if tp_pct is not None:
-            p = tp_pct / Decimal("100")
+            p = self._pnl_pct_to_price_fraction(raw, tp_pct, leverage)
             tp = market_price * (Decimal("1") + p) if raw in {"OPEN_LONG", "SPOT_BUY"} else market_price * (Decimal("1") - p)
         if sl_pct is not None:
-            p = sl_pct / Decimal("100")
+            p = self._pnl_pct_to_price_fraction(raw, sl_pct, leverage)
             sl = market_price * (Decimal("1") - p) if raw in {"OPEN_LONG", "SPOT_BUY"} else market_price * (Decimal("1") + p)
         return tp, sl
 
@@ -252,7 +265,14 @@ class RiskGuard:
         if raw == "SPOT_SELL_ALL":
             return {"action": raw, "symbol": symbol, "category": "spot", "reason": reason}
 
-        pct_tp, pct_sl = self._apply_explicit_tp_sl_pct(raw, action, market_price)
+        leverage_hint = 1
+        if raw in {"OPEN_LONG", "OPEN_SHORT"}:
+            try:
+                leverage_hint = int(action.get("leverage") or 1)
+            except Exception:
+                leverage_hint = 1
+
+        pct_tp, pct_sl = self._apply_explicit_tp_sl_pct(raw, action, market_price, leverage_hint)
         take_profit = pct_tp if pct_tp is not None else self._decimal(action.get("take_profit"), "take_profit", required=False)
         stop_loss = pct_sl if pct_sl is not None else self._decimal(action.get("stop_loss"), "stop_loss", required=False)
 
@@ -264,7 +284,7 @@ class RiskGuard:
             )
 
         if not explicit_required:
-            take_profit, stop_loss = self._apply_default_tp_sl(raw, take_profit, stop_loss, market_price)
+            take_profit, stop_loss = self._apply_default_tp_sl(raw, take_profit, stop_loss, market_price, leverage_hint)
         take_profit, stop_loss = self._round_tp_sl_to_tick(take_profit, stop_loss, price_tick)
 
         if raw == "SPOT_BUY":
@@ -363,6 +383,7 @@ class RiskGuard:
             "qty": format(qty.normalize(), "f"),
             "take_profit": format(take_profit.normalize(), "f") if take_profit else None,
             "stop_loss": format(stop_loss.normalize(), "f") if stop_loss else None,
+            "tp_sl_pct_mode": "pnl" if raw in {"OPEN_LONG", "OPEN_SHORT"} else "price",
             "reason": reason,
         }
 

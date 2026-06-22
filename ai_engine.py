@@ -762,7 +762,7 @@ Market selection rules:
 - For OPEN_LONG: stop_loss must be below current price and take_profit above current price.
 - For OPEN_SHORT: stop_loss must be above current price and take_profit below current price.
 - For SPOT_BUY: stop_loss must be below current price and take_profit above current price.
-- If the user gives TP/SL as explicit percentages, return take_profit_pct and stop_loss_pct. If the strategy uses ATR, R-multiple, structure, support/resistance, or says TP/SL must be explicit, you MUST return concrete take_profit and stop_loss prices. Do not rely on default TP/SL for strategy prompts.
+- If the user gives TP/SL as explicit percentages, return take_profit_pct and stop_loss_pct. For futures, percentage TP/SL means PNL/ROI percent on margin, not BTC price percent; RiskGuard converts it to exchange price. For spot, percentage TP/SL means normal price percent. If the strategy uses ATR, R-multiple, structure, support/resistance, or says TP/SL must be explicit, you MUST return concrete take_profit and stop_loss prices. Do not rely on default TP/SL for strategy prompts.
 - Only use symbols listed in risk_config.allowed_symbols.
 - Do not exceed risk_config limits.
 - Never request withdrawal, transfer, API-key changes, or account movement.
