@@ -1,150 +1,601 @@
-<<<<<<< HEAD
-# CIG AI Subaccount Clean V54
+# CIG AI Subaccount
 
-Bản V54 nâng cấp từ V53, tập trung vào **clean live log cho Multi-Symbol RSI Watch Engine** và sửa lỗi log `3 nến mới` bị hiển thị dạng Python list/cắt cụt.
+CIG AI Subaccount là dashboard AI dùng để quản lý giao dịch Bybit theo từng workspace/sub-account riêng. Mỗi workspace có API key riêng, prompt riêng, cấu hình rủi ro riêng, live log riêng và bảng theo dõi lệnh riêng.
 
-## Fix chính trong V54
-=======
-# CIG AI Subaccount Clean V49
+Bản **V60** tập trung vào nâng cấp phần **AI Backtest** để không còn bị kẹt ở parser RSI cũ. Backtest có thể đọc JSON strategy và sử dụng nhiều chỉ báo kỹ thuật khác nhau thông qua **Universal Indicator Backtest Engine**.
 
-Bản V49 dựa trên V48 và sửa đúng 2 điểm quan trọng:
+> Khuyến nghị: luôn chạy `DRY_RUN=true` khi cài lần đầu hoặc deploy bản mới. Chỉ bật live bằng `DRY_RUN=false` sau khi đã test parser, risk guard, API key và nút đóng lệnh.
 
-1. **TP/SL dạng `%` cho Futures được tính theo % PNL/ROI trên margin**, không còn tính trực tiếp theo % giá BTC.
-2. **Nút “Đóng theo dõi” trong bảng lệnh đổi thành “Đóng lệnh”** và khi bấm sẽ gửi lệnh reduce-only lên Bybit để đóng đúng vị thế/lượng đang được tracker ghi nhận.
+---
 
-> Khuyến nghị: deploy trước với `DRY_RUN=true`, test parser + nút đóng lệnh, sau đó mới bật live bằng `DRY_RUN=false`.
->>>>>>> 78582718eada4d79132653992ba32f60d5dbdc92
+## 1. Tính năng chính
 
-### 0. Clean Live Log cho Rule Engine
+### Dashboard workspace/sub-account
 
-<<<<<<< HEAD
-V54 đổi log của prompt-only/rule-engine từ nhãn `AI:` sang `Rule Engine:` để tránh hiểu nhầm là bot đang gọi AI.
+- Quản lý workspace/user riêng.
+- Mỗi workspace có Bybit API key riêng.
+- Mỗi workspace có prompt chiến lược riêng.
+- Mỗi workspace có cấu hình risk riêng.
+- Live log riêng cho từng workspace.
+- Bảng theo dõi lệnh riêng.
 
-Trước V54:
+### Bybit Futures/Spot
 
-```text
-AI: WAIT MULTI · Chưa có cặp nào đủ điều kiện... BNBUSDT: ... 3 nến mới=['green', | BTCUSDT: ...
-```
+- Hỗ trợ Bybit V5.
+- Futures Linear mặc định cho BTCUSDT và các cặp allowed symbols.
+- Hỗ trợ dry-run để test không gửi lệnh thật.
+- Có direct command để mở/đóng lệnh nhanh.
+- Nút **Đóng lệnh** có thể gửi reduce-only market order khi live.
 
-Sau V54:
+### AI Backtest Menu
 
-```text
-Rule Engine: WAIT MULTI · Chưa có cặp nào đủ điều kiện RSI 5m + 2 nến xác nhận. · BNBUSDT: RSI5=47.80 · watch=NONE · nến gần nhất=red · 3 nến=green,red,red · trigger LONG<27.0 / SHORT>66.0 | BTCUSDT: RSI5=46.99 · watch=NONE · nến gần nhất=red · 3 nến=red,green,red · trigger LONG<27.0 / SHORT>66.0
-```
+- Menu riêng **AI Backtest**.
+- Nhập symbol hoặc nhiều symbol.
+- Chọn market, timeframe, start/end UTC.
+- Nhập prompt hoặc JSON strategy để test.
+- Nhập vốn test, margin, leverage, fee, slippage.
+- Xuất kết quả: winrate, PNL USDT, PNL %, vốn cuối, tổng lệnh, lệnh thắng/thua, max drawdown.
+- Có bảng từng lệnh và tải CSV.
 
-Điểm sửa:
+### Universal Indicator Backtest Engine V60
 
-- Không còn dùng Python list repr như `['green', 'red']` trong live log.
-- Không còn bị cắt ở `['green',` làm tưởng chỉ có 1 nến.
-- Mỗi symbol hiển thị đủ: RSI5, trạng thái watch, nến gần nhất, 3 nến gần nhất, trigger cần đạt.
-- Khi rule engine xử lý xong, log ghi `Rule Engine đã xử lý xong`, không ghi `AI đã phân tích xong`.
+V60 hỗ trợ generic condition evaluator để JSON strategy có thể dùng nhiều chỉ báo:
 
+- EMA
+- SMA
+- WMA
+- RSI
+- MACD
+- MACD Signal
+- MACD Histogram
+- Bollinger Bands
+- VWAP rolling
+- ATR
+- ADX
+- Stochastic %K / %D
+- CCI
+- ROC
+- MFI
+- Volume MA
 
-### 1. Strategy loop trade nhiều cặp
+Các biến nến có thể dùng trong condition:
 
-V52 đã có `LONG_WATCH` / `SHORT_WATCH`, nhưng chủ yếu chạy đúng cho một symbol chính như `BTCUSDT`.
+- `open`
+- `high`
+- `low`
+- `close`
+- `previous_close`
+- `volume_current`
+- `body`
+- `upper_wick`
+- `lower_wick`
+- `is_green`
+- `is_red`
+- `is_doji`
 
-V53 sửa thành quét nhiều symbol futures linear theo `allowed_symbols` hoặc danh sách symbol trong prompt.
-
-Ví dụ:
-
-```text
-BTCUSDT, ETHUSDT, SOLUSDT, BNBUSDT, XRPUSDT
-```
-
-Mỗi vòng quét, bot sẽ lấy snapshot riêng cho từng cặp:
-
-```text
-linear:BTCUSDT
-linear:ETHUSDT
-linear:SOLUSDT
-linear:BNBUSDT
-linear:XRPUSDT
-```
-
-### 2. State riêng cho từng cặp
-
-Mỗi cặp có file trạng thái riêng trong Railway Volume:
-
-```text
-/data/strategy_state/user_<id>_BTCUSDT_rsi5m_watch.json
-/data/strategy_state/user_<id>_ETHUSDT_rsi5m_watch.json
-/data/strategy_state/user_<id>_SOLUSDT_rsi5m_watch.json
-```
-
-Logic đúng:
-
-```text
-RSI 5m < oversold
-→ bật LONG_WATCH cho đúng symbol đó
-→ đếm 2 nến 5m tiếp theo của đúng symbol đó
-→ nếu đủ 2 nến xanh liên tiếp thì OPEN_LONG symbol đó
-```
+Kết quả đúng của V60 trong cột Reason sẽ có dạng:
 
 ```text
-RSI 5m > overbought
-→ bật SHORT_WATCH cho đúng symbol đó
-→ đếm 2 nến 5m tiếp theo của đúng symbol đó
-→ nếu đủ 2 nến đỏ liên tiếp thì OPEN_SHORT symbol đó
+Generic indicators: LONG matched
+Generic indicators: SHORT matched
 ```
 
-### 3. Có thể mở nhiều tín hiệu trong cùng một vòng quét
-
-Nếu nhiều cặp cùng hoàn tất xác nhận trong một vòng quét, engine có thể trả về `BATCH`:
-
-```json
-{
-  "action": "BATCH",
-  "symbol": "MULTI",
-  "actions": [
-    {"action": "OPEN_SHORT", "symbol": "BTCUSDT"},
-    {"action": "OPEN_LONG", "symbol": "ETHUSDT"}
-  ]
-}
-```
-
-`analyze_and_execute` đã hỗ trợ batch và sẽ xử lý từng tín hiệu qua Risk Guard trước khi gửi Bybit.
-
-### 4. Prompt-only vẫn được giữ
-
-Nếu prompt chỉ yêu cầu:
+Nếu vẫn thấy:
 
 ```text
-5m + RSI + màu nến 5m
+Plan LONG: RSI trigger...
+Plan SHORT: RSI trigger...
 ```
 
-bot vẫn không dùng:
+thì app vẫn đang chạy engine cũ hoặc JSON strategy chưa kích hoạt generic evaluator.
+
+---
+
+## 2. Cấu trúc project
 
 ```text
-D1 / H4 / H1 / M15
-EMA / MACD / ATR / VWAP / Support / Resistance
+.
+├── app.py
+├── backtest_engine.py
+├── bybit_client.py
+├── ai_engine.py
+├── indicator_engine.py
+├── risk_guard.py
+├── storage.py
+├── requirements.txt
+├── Dockerfile
+├── railway.json
+├── .env.example
+├── templates/
+├── static/
+└── README.md
 ```
 
-### 5. Live Log dễ đọc hơn cho multi-symbol
+Các file quan trọng:
 
-Log market sẽ hiển thị nhiều cặp:
+| File | Chức năng |
+|---|---|
+| `app.py` | FastAPI app, dashboard, route API, backtest endpoint |
+| `backtest_engine.py` | Universal Indicator Backtest Engine V60 |
+| `bybit_client.py` | Bybit V5 client |
+| `ai_engine.py` | AI decision/compile logic |
+| `indicator_engine.py` | Tính indicator cho live/backtest |
+| `risk_guard.py` | Kiểm soát rủi ro |
+| `storage.py` | SQLite storage |
+| `templates/` | HTML dashboard |
+| `static/` | CSS/assets |
 
-```text
-Market MULTI LINEAR · BTCUSDT giá ... · 5M: RSI ... | ETHUSDT giá ... · 5M: RSI ... | SOLUSDT giá ...
-```
+---
 
-## Cấu hình cần set trong dashboard/Railway
+## 3. Biến môi trường
 
-Để trade nhiều cặp, cần set `allowed_symbols` trong dashboard hoặc env:
+Tạo file `.env` từ `.env.example`.
+
+### Cấu hình app
 
 ```env
-ALLOWED_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT
+APP_SECRET=change-this-secret
+RUNTIME_DIR=./data
+DATABASE_URL=sqlite:///./data/app.db
+DRY_RUN=true
+AI_DEBUG_LOGS=false
+```
+
+### OpenAI
+
+```env
+OPENAI_API_KEY=sk-your-key
+OPENAI_MODEL=gpt-4o-mini
+OPENAI_FALLBACK_MODELS=gpt-4o-mini,gpt-4.1-mini
+```
+
+### Bybit
+
+API key có thể nhập trong dashboard theo từng workspace. Nếu muốn dùng env mặc định:
+
+```env
+BYBIT_API_KEY=your-bybit-api-key
+BYBIT_API_SECRET=your-bybit-api-secret
+BYBIT_TESTNET=false
+```
+
+### Risk settings
+
+```env
 DEFAULT_CATEGORY=linear
+ALLOWED_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT
 MAX_LEVERAGE=20
 MAX_MARGIN_PER_TRADE_USDT=20
 MAX_NOTIONAL_USDT=300
 MAX_DAILY_TRADES=10
+REQUIRE_TP_SL=true
+DEFAULT_TAKE_PROFIT_PCT=10
+DEFAULT_STOP_LOSS_PCT=5
+```
+
+Ghi chú:
+
+- Với Futures, TP/SL trong live trading nên được hiểu theo `% PNL/ROI trên margin` nếu code route live đang dùng converter ROI.
+- Trong backtest V60, nhiều strategy JSON dùng `take_profit_price_percent` và `stop_loss_price_percent`, tức là **% theo giá**. Với leverage 10x, `TP 0.75% giá` xấp xỉ `+7.5% margin` trước phí.
+
+---
+
+## 4. Cài đặt local
+
+### 4.1. Yêu cầu
+
+- Python 3.10+
+- Git
+- Tài khoản OpenAI nếu dùng AI compile/decision
+- Tài khoản Bybit nếu test API hoặc trade thật
+
+### 4.2. Clone hoặc giải nén source
+
+Nếu dùng Git:
+
+```bash
+git clone <YOUR_REPO_URL>
+cd <YOUR_REPO_FOLDER>
+```
+
+Nếu dùng file ZIP:
+
+```bash
+unzip cig_ai_subaccount_clean_v60_full_clean.zip
+cd cig_ai_subaccount_clean_v60_full_clean
+```
+
+### 4.3. Tạo virtual environment
+
+macOS/Linux:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+Windows PowerShell:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+Windows CMD:
+
+```cmd
+python -m venv .venv
+.venv\Scripts\activate.bat
+```
+
+### 4.4. Cài thư viện
+
+```bash
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+### 4.5. Tạo file `.env`
+
+macOS/Linux:
+
+```bash
+cp .env.example .env
+```
+
+Windows PowerShell:
+
+```powershell
+copy .env.example .env
+```
+
+Sau đó sửa `.env`:
+
+```env
+APP_SECRET=local-dev-secret
+RUNTIME_DIR=./data
+DATABASE_URL=sqlite:///./data/app.db
+DRY_RUN=true
+AI_DEBUG_LOGS=false
+OPENAI_API_KEY=sk-your-key
+OPENAI_MODEL=gpt-4o-mini
+```
+
+### 4.6. Tạo thư mục data
+
+macOS/Linux:
+
+```bash
+mkdir -p data
+```
+
+Windows PowerShell:
+
+```powershell
+mkdir data
+```
+
+### 4.7. Chạy app local
+
+```bash
+uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Mở trình duyệt:
+
+```text
+http://localhost:8000
+```
+
+### 4.8. Kiểm tra compile trước khi chạy
+
+```bash
+python -m py_compile app.py backtest_engine.py bybit_client.py ai_engine.py indicator_engine.py storage.py risk_guard.py
+```
+
+Nếu lệnh này không báo lỗi là source Python cơ bản ổn.
+
+---
+
+## 5. Cài đặt bằng Docker local
+
+Build image:
+
+```bash
+docker build -t cig-ai-subaccount:v60 .
+```
+
+Chạy container:
+
+```bash
+docker run --rm -p 8000:8000 \
+  --env-file .env \
+  -v $(pwd)/data:/data \
+  cig-ai-subaccount:v60
+```
+
+Trên Windows PowerShell, volume có thể dùng:
+
+```powershell
+docker run --rm -p 8000:8000 --env-file .env -v ${PWD}\data:/data cig-ai-subaccount:v60
+```
+
+Nếu dùng Docker với `/data`, `.env` nên set:
+
+```env
+RUNTIME_DIR=/data
+DATABASE_URL=sqlite:////data/app.db
+```
+
+---
+
+## 6. Deploy Railway
+
+### 6.1. Chuẩn bị repo
+
+Root repo cần có:
+
+```text
+Dockerfile
+requirements.txt
+app.py
+railway.json
+README.md
+```
+
+Commit code:
+
+```bash
+git add .
+git commit -m "Deploy CIG AI Subaccount V60"
+git push
+```
+
+### 6.2. Tạo Railway project
+
+1. Vào Railway.
+2. Chọn **New Project**.
+3. Chọn **Deploy from GitHub repo**.
+4. Chọn repo chứa source.
+5. Railway sẽ dùng `Dockerfile` để build.
+
+### 6.3. Tạo Railway Volume
+
+Tạo volume mount vào:
+
+```text
+/data
+```
+
+Không xoá các file sau trong volume:
+
+```text
+/data/app.db
+/data/app.db-wal
+/data/app.db-shm
+/data/strategy_state/
+```
+
+Đây là dữ liệu workspace, cấu hình user, state chiến lược và SQLite WAL/SHM.
+
+### 6.4. Set biến môi trường trên Railway
+
+Trong tab Variables, set:
+
+```env
+APP_SECRET=your-production-secret
+RUNTIME_DIR=/data
+DATABASE_URL=sqlite:////data/app.db
+DRY_RUN=true
+AI_DEBUG_LOGS=false
+OPENAI_API_KEY=sk-your-key
+OPENAI_MODEL=gpt-4o-mini
+OPENAI_FALLBACK_MODELS=gpt-4o-mini,gpt-4.1-mini
+DEFAULT_CATEGORY=linear
+ALLOWED_SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT
+MAX_LEVERAGE=20
+MAX_MARGIN_PER_TRADE_USDT=20
+MAX_NOTIONAL_USDT=300
+MAX_DAILY_TRADES=10
+REQUIRE_TP_SL=true
+```
+
+Nếu muốn live trading, sau khi test xong mới đổi:
+
+```env
+DRY_RUN=false
+```
+
+### 6.5. Deploy
+
+Railway sẽ tự build khi repo có commit mới.
+
+Sau deploy, mở domain Railway hoặc custom domain và kiểm tra:
+
+- Dashboard load được.
+- Vào được **AI Backtest**.
+- SQLite không báo lỗi permission.
+- Live log ghi được.
+- Backtest có thể tải kline public.
+
+---
+
+## 7. Checklist test sau deploy
+
+### 7.1. Test app boot
+
+Mở Railway logs, kỳ vọng không có lỗi import hoặc lỗi SQLite.
+
+Nếu có lỗi database path, kiểm tra:
+
+```env
+RUNTIME_DIR=/data
+DATABASE_URL=sqlite:////data/app.db
+```
+
+### 7.2. Test DRY_RUN
+
+Đảm bảo biến:
+
+```env
 DRY_RUN=true
 ```
 
-> Nếu workspace cũ đang lưu `allowed_symbols=BTCUSDT,ETHUSDT` trong `/data/app.db`, deploy code mới sẽ không tự ghi đè database cũ. Hãy vào dashboard sửa Allowed Symbols thủ công.
+Sau đó thử direct command hoặc backtest. Bot không được gửi order thật.
 
-## Prompt mẫu multi-symbol
+### 7.3. Test AI Backtest V60
+
+Vào menu **AI Backtest** và dán JSON mẫu:
+
+```json
+{
+  "strategy_name": "BTCUSDT_15M_EMA_TREND_PULLBACK_GENERIC_V1",
+  "strategy_type": "generic_condition_engine",
+  "market": {
+    "symbol": "BTCUSDT",
+    "market": "linear_futures",
+    "timeframe": "15m",
+    "mode": "backtest_ai_once"
+  },
+  "capital": {
+    "margin_per_trade_usdt": 10,
+    "max_leverage": 10
+  },
+  "tp_sl": {
+    "take_profit_price_percent": 0.75,
+    "stop_loss_price_percent": 0.45
+  },
+  "indicators": {
+    "ema20": { "type": "ema", "period": 20 },
+    "ema50": { "type": "ema", "period": 50 },
+    "ema200": { "type": "ema", "period": 200 },
+    "rsi14": { "type": "rsi", "period": 14 },
+    "adx14": { "type": "adx", "period": 14 },
+    "atr14": { "type": "atr", "period": 14 },
+    "volume_ma20": { "type": "volume_ma", "period": 20 }
+  },
+  "global_filters": {
+    "required": [
+      "adx14 >= 15",
+      "adx14 <= 38",
+      "volume_current >= volume_ma20 * 0.8",
+      "current candle is not doji"
+    ]
+  },
+  "long_rule": {
+    "enabled": true,
+    "all_required": [
+      "close > ema200",
+      "ema20 > ema50",
+      "ema50 > ema200",
+      "ema20_slope > 0",
+      "rsi14 >= 42",
+      "rsi14 <= 62",
+      "current candle is green",
+      "current close > previous close",
+      "distance_from_close_to_ema20_percent <= 0.75"
+    ]
+  },
+  "short_rule": {
+    "enabled": true,
+    "all_required": [
+      "close < ema200",
+      "ema20 < ema50",
+      "ema50 < ema200",
+      "ema20_slope < 0",
+      "rsi14 >= 38",
+      "rsi14 <= 58",
+      "current candle is red",
+      "current close < previous close",
+      "distance_from_close_to_ema20_percent <= 0.75"
+    ]
+  }
+}
+```
+
+Kết quả đúng phải có Reason kiểu:
+
+```text
+Generic indicators: LONG matched
+Generic indicators: SHORT matched
+```
+
+Nếu vẫn thấy:
+
+```text
+Plan LONG: RSI trigger...
+```
+
+thì Railway đang chạy bản cũ hoặc prompt không kích hoạt generic evaluator.
+
+### 7.4. Test direct command futures TP/SL
+
+Nhập thử:
+
+```text
+long btc 10u x20 tp 10% sl 5%
+```
+
+Với Futures, kỳ vọng TP/SL được quy đổi theo PNL/ROI trên margin nếu direct command converter đang bật:
+
+```text
+TP price move = 10% / 20 = 0.5%
+SL price move = 5% / 20 = 0.25%
+```
+
+### 7.5. Test nút đóng lệnh
+
+1. Có lệnh trong tracker.
+2. Bấm **Đóng lệnh**.
+3. Nếu `DRY_RUN=true`, log phải ghi không gửi Bybit.
+4. Nếu `DRY_RUN=false`, log phải ghi đã gửi reduce-only market order.
+
+---
+
+## 8. JSON strategy condition syntax
+
+V60 hỗ trợ condition dạng string:
+
+```text
+close > ema200
+ema20 > ema50
+rsi14 >= 55
+adx14 <= 25
+volume_current >= volume_ma20 * 0.8
+distance_from_close_to_ema20_percent <= 0.75
+current candle is green
+current candle is red
+current candle is not doji
+current close > previous close
+current close < previous close
+ema20_slope > 0
+ema20_slope < 0
+```
+
+Hoặc dạng object:
+
+```json
+{
+  "left": "close",
+  "op": ">",
+  "right": "ema200"
+}
+```
+
+Các toán tử hỗ trợ:
+
+```text
+>
+>=
+<
+<=
+==
+!=
+```
+
+---
+
+## 9. Prompt mẫu multi-symbol RSI 5M
 
 ```text
 Bạn là CIG AI Trading Agent giao dịch Perpetual Futures trên Bybit.
@@ -197,331 +648,128 @@ YÊU CẦU ĐẦU RA:
 Chỉ trả JSON hợp lệ. Không markdown.
 ```
 
-## Giữ nguyên các fix trước
+---
 
-- V48: Direct Command không bị control/allowed_symbols bắt nhầm.
-- V49: TP/SL futures `%` tính theo `% PNL` trên margin.
-- V50: fix lỗi thiếu `static/` khi deploy Railway.
-- V51: Prompt-only không lấy D1/H4/H1/M15 hoặc EMA/MACD/ATR nếu prompt cấm.
-- V52: Stateful RSI Watch cho một symbol.
-- V53: Multi-Symbol RSI Watch + batch execution.
+## 10. Lịch sử nâng cấp chính
 
-## Deploy Railway
+### V49
+
+- Futures TP/SL `%` được tính theo `% PNL/ROI trên margin`, không còn tính trực tiếp theo `% giá BTC`.
+- Nút **Đóng lệnh** gửi reduce-only order lên Bybit khi live.
+
+### V54
+
+- Clean live log cho Multi-Symbol RSI Watch Engine.
+- Log đổi từ `AI:` sang `Rule Engine:` khi không gọi AI thật.
+- Không còn hiển thị Python list bị cắt cụt trong log nến.
+
+### V55
+
+- Thêm menu **AI Backtest**.
+- Backtest dùng dữ liệu Bybit public kline, không gửi order thật.
+
+### V57
+
+- Sửa range backtest cho AI-once/rule mode.
+- Symbol input hỗ trợ một symbol hoặc nhiều symbol cách nhau bằng dấu phẩy/khoảng trắng.
+
+### V58
+
+- Thêm preset winrate cao.
+- Thêm wait/block metrics.
+
+### V59
+
+- Fix JSON plan parse.
+- Hỗ trợ dùng JSON strategy trực tiếp từ prompt, không cần AI compile.
+
+### V60
+
+- Thêm Universal Indicator Backtest Engine.
+- Hỗ trợ generic condition evaluator.
+- Có thể dùng EMA, SMA, WMA, RSI, MACD, Bollinger, VWAP, ATR, ADX, Stochastic, CCI, ROC, MFI, Volume MA.
+
+---
+
+## 11. Lưu ý an toàn
+
+- Backtest không đảm bảo lợi nhuận khi live.
+- Kết quả backtest có thể khác live do spread, slippage, funding, latency và orderbook.
+- Không nên all-in hoặc martingale.
+- Luôn test với `DRY_RUN=true` trước.
+- Nếu dùng futures leverage, TP/SL phải kiểm tra đúng đơn vị: `% giá` khác `% PNL trên margin`.
+- Không xoá Railway Volume `/data` nếu muốn giữ workspace/database.
+
+---
+
+## 12. Troubleshooting
+
+### Lỗi merge conflict
+
+Nếu thấy:
+
+```text
+<<<<<<< HEAD
 =======
-## 1. Fix TP/SL % theo PNL Futures
-
-Trước V49:
-
-```text
-long BTC 10u x20 TP 10% SL 5%
+>>>>>>> branch-name
 ```
 
-Bot hiểu TP/SL là % giá:
+Không bấm Continue Merge. Chạy:
 
-```text
-TP giá +10%
-SL giá -5%
+```bash
+git merge --abort
+git reset --hard HEAD
 ```
 
-Cách này sai với futures scalping vì TP 10% giá ở BTC là quá xa.
+Sau đó dùng source sạch hoặc resolve thủ công.
 
-Từ V49, với Futures/Linear:
+### Backtest vẫn chạy RSI parser cũ
 
-```text
-TP 10% = lời 10% trên margin
-SL 5% = lỗ 5% trên margin
-```
-
-Bot tự quy đổi sang % giá theo leverage:
+Dấu hiệu:
 
 ```text
-price_move_pct = pnl_pct / leverage
+Plan LONG: RSI trigger...
 ```
 
-Ví dụ:
+Cách xử lý:
+
+1. Kiểm tra đã deploy đúng V60 chưa.
+2. Kiểm tra `backtest_engine.py` có generic evaluator chưa.
+3. Dùng JSON có:
+
+```json
+"strategy_type": "generic_condition_engine"
+```
+
+4. Deploy lại Railway và kiểm tra logs.
+
+### JSON strategy không chạy
+
+Nếu thấy:
 
 ```text
-Entry: 60,000
-Leverage: 20x
-Margin: 10 USDT
-TP: 10% PNL
-SL: 5% PNL
+AI plan lỗi, dùng local parser plan: JSONDecodeError
 ```
 
-Bot sẽ quy đổi:
+Cách xử lý:
 
-```text
-TP price move = 10% / 20 = 0.5%
-SL price move = 5% / 20 = 0.25%
-```
+- Đảm bảo JSON không có markdown fence.
+- Không thêm chữ trước/sau JSON.
+- Dùng V59/V60 để parse JSON trực tiếp.
 
-Với Long:
+### SQLite database locked
 
-```text
-TP ≈ 60,300
-SL ≈ 59,850
-```
+- Không chạy nhiều process ghi cùng DB nếu không cần.
+- Đảm bảo Railway chỉ chạy một replica nếu dùng SQLite.
+- Không xoá WAL/SHM khi app đang chạy.
 
-Với Short:
+### Railway không lưu dữ liệu
 
-```text
-TP ≈ 59,700
-SL ≈ 60,150
-```
-
-Spot vẫn giữ cách cũ: TP/SL `%` là % giá vì Spot không có leverage.
-
----
-
-## 2. Nút “Đóng lệnh” gửi tín hiệu thật lên Bybit
-
-Trước V49, nút trong bảng theo dõi chỉ đóng trạng thái local:
-
-```text
-Đóng theo dõi
-```
-
-Nó không gửi lệnh đóng vị thế lên Bybit.
-
-Từ V49, nút đổi thành:
-
-```text
-Đóng lệnh
-```
-
-Khi bấm:
-
-- Nếu `DRY_RUN=true`: chỉ đóng theo dõi local, không gửi Bybit.
-- Nếu `DRY_RUN=false` và lệnh là Futures: gửi lệnh **Market reduce-only** để đóng đúng `symbol`, `side`, `qty` đang lưu trong tracker.
-- Nếu tracker thiếu `qty`: fallback sang đóng toàn bộ vị thế cùng symbol/side.
-- Nếu Bybit báo không còn position: bot đóng tracker local và ghi log.
-
-Ví dụ log đúng:
-
-```text
-Đã gửi Bybit đóng lệnh #44: BTCUSDT short · qty 0.003 · reduceOnly market.
-```
-
----
-
-## 3. Tính năng kế thừa từ V48
-
-V49 giữ toàn bộ fix của V48:
-
-### 3.1. Tách rõ 3 luồng lệnh
-
-| Luồng | Mục đích | Ví dụ |
-|---|---|---|
-| Bot Control | Đổi cấu hình bot | `bật dry-run`, `đổi max leverage thành 20` |
-| Strategy Prompt | Prompt chạy vòng lặp | `Trade BTC khung 5m, RSI dưới 27...` |
-| Direct Execution Command | Hành động ngay | `đóng hết lệnh future btc`, `long btc 10u x20` |
-
-### 3.2. Direct command không bị AI tự biên chiến lược
-
-Các lệnh rõ ràng như:
-
-```text
-đóng hết lệnh future btc
-close all btc future
-đóng short btc future
-đóng long btc
-long btc 10u x20 tp 10% sl 5%
-mua spot btc 20u
-```
-
-được parser nội bộ xử lý, không gọi AI phân tích D1/H4/H1/EMA/MACD.
-
-### 3.3. Close futures map chuẩn
-
-| User nhập | Action | Category | Symbol |
-|---|---|---|---|
-| `đóng hết lệnh future btc` | `CLOSE_ALL` | `linear` | `BTCUSDT` |
-| `đóng long btc` | `CLOSE_LONG` | `linear` | `BTCUSDT` |
-| `đóng short btc` | `CLOSE_SHORT` | `linear` | `BTCUSDT` |
-
----
-
-## 4. Biến môi trường khuyến nghị
+Kiểm tra biến:
 
 ```env
-APP_SECRET=your-fixed-secret
 RUNTIME_DIR=/data
 DATABASE_URL=sqlite:////data/app.db
-DRY_RUN=true
-AI_DEBUG_LOGS=false
-
-OPENAI_API_KEY=sk-your-key
-OPENAI_MODEL=gpt-4o-mini
-OPENAI_FALLBACK_MODELS=gpt-4o-mini,gpt-4.1-mini
 ```
 
-Risk settings nên set trong dashboard hoặc env:
-
-```env
-MAX_LEVERAGE=20
-MAX_MARGIN_PER_TRADE_USDT=20
-MAX_NOTIONAL_USDT=500
-MAX_DAILY_TRADES=2
-REQUIRE_TP_SL=true
-DEFAULT_TAKE_PROFIT_PCT=10
-DEFAULT_STOP_LOSS_PCT=5
-```
-
-Ghi chú: `DEFAULT_TAKE_PROFIT_PCT` và `DEFAULT_STOP_LOSS_PCT` với Futures được hiểu là `% PNL`, không phải `% giá`.
->>>>>>> 78582718eada4d79132653992ba32f60d5dbdc92
-
-1. Giải nén zip.
-2. Push repo lên GitHub.
-3. Railway deploy từ repo.
-4. Không xoá Railway Volume `/data`.
-5. Không xoá `/data/app.db`.
-6. Vào dashboard sửa Allowed Symbols nếu workspace cũ chưa có đủ cặp.
-
-<<<<<<< HEAD
-
-=======
-## 5. Cài đặt local
-
-```bash
-unzip cig_ai_subaccount_clean_v49.zip
-cd cig_ai_subaccount_clean_v49
-python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-Tạo `.env`:
-
-```env
-APP_SECRET=local-dev-secret
-RUNTIME_DIR=./data
-DATABASE_URL=sqlite:///./data/app.db
-DRY_RUN=true
-AI_DEBUG_LOGS=false
-OPENAI_API_KEY=sk-your-key
-```
-
-Chạy:
-
-```bash
-mkdir -p data
-uvicorn app:app --host 0.0.0.0 --port 8000 --reload
-```
->>>>>>> 78582718eada4d79132653992ba32f60d5dbdc92
-
-## V55 - AI Backtest Menu
-
-Bản này gắn thêm menu **AI Backtest** trực tiếp vào dashboard gốc V54.
-
-Tính năng mới:
-
-- Menu riêng `AI Backtest` trong sidebar.
-- Nhập symbol, market, khung thời gian, start/end UTC.
-- Nhập prompt muốn test hoặc dùng prompt đang lưu.
-- Nhập vốn test, margin mỗi lệnh, leverage, fee, slippage.
-- Dùng lại parser prompt, DecisionEngine/OpenAI và risk context của bot trade thật.
-- Với prompt RSI 5m + 2 nến xác nhận, backtest dùng Rule Engine stateful riêng trong RAM, không đụng state live trong `/data/strategy_state`.
-- Không gửi order thật lên Bybit; chỉ dùng dữ liệu public kline để giả lập.
-- Xuất kết quả: winrate, PNL USDT, PNL %, vốn cuối, tổng lệnh, lệnh thắng/thua, max drawdown, từng lệnh chi tiết và CSV.
-
-Endpoint mới:
-
-```text
-POST /api/backtest/run
-```
-
-Lưu ý:
-
-<<<<<<< HEAD
-- Backtest dùng OHLCV, không phải tick/orderbook.
-- Nếu cùng một nến chạm cả TP và SL, engine tính SL trước để bảo thủ.
-- Backtest nhiều nến bằng AI có thể tốn token; UI có trường giới hạn số nến gọi AI.
-
-
-## V57 Backtest fixes
-
-- Fixed ai_once/rule backtest range: `max_ai_candles` now limits only `AI từng nến`; AI-once and Rule mode process the full requested candle range.
-- Added explicit result range fields: requested range, loaded data range, and actual processed range.
-- Backtest Symbol input now accepts one symbol or a comma/space-separated list such as `BTCUSDT ETHUSDT SOLUSDT BNBUSDT XRPUSDT`.
-- Multi-symbol backtest aggregates metrics and keeps the symbol column in every trade row. In multi-symbol mode each symbol receives the configured test capital separately.
-
-
-## V58 High-Winrate Backtest Preset
-
-- Added a Backtest preset button: `Preset Winrate cao`.
-- Added deterministic high-winrate plan support for AI-once backtest mode.
-- Added filters: RSI reclaim/reject, EMA20/EMA50 alignment, trend filter, distance to EMA50, ATR band, volume-not-low, and cooldown candles.
-- Added `entry_cooldown_candles` to the Backtest API payload.
-- Backtest metrics now include `wait_count` and `blocked_count` aliases for aggregation consistency.
-
-Important: this preset is designed to reduce weak entries and improve measured winrate, not to guarantee profit or future live performance.
-=======
-## 6. Deploy Railway
-
-Đảm bảo root repo có:
-
-```text
-Dockerfile
-requirements.txt
-app.py
-railway.json
-README.md
-```
-
-Railway Volume:
-
-```text
-/data
-```
-
-Không xoá:
-
-```text
-/data/app.db
-/data/app.db-wal
-/data/app.db-shm
-```
-
-Deploy:
-
-```bash
-git add .
-git commit -m "CIG AI Subaccount Clean V49"
-git push
-```
-
----
-
-## 7. Checklist test sau deploy
-
-### Test TP/SL PNL
-
-Nhập direct command:
-
-```text
-long btc 10u x20 tp 10% sl 5%
-```
-
-Kỳ vọng nếu BTC khoảng 60,000:
-
-```text
-TP khoảng 60,300
-SL khoảng 59,850
-```
-
-Không còn TP 66,000 / SL 57,000.
-
-### Test nút Đóng lệnh
-
-1. Có một lệnh futures đang mở trong tracker.
-2. Bấm **Đóng lệnh**.
-3. Nếu `DRY_RUN=true`, log phải ghi không gửi Bybit.
-4. Nếu `DRY_RUN=false`, log phải ghi đã gửi Bybit đóng lệnh reduce-only.
-
----
-
-## 8. Lưu ý kỹ thuật
-
-Bybit futures thường quản lý vị thế theo `symbol + side`. Nếu sàn đang ở chế độ net/hedge, tracker sẽ cố đóng đúng lượng `qty` của dòng lệnh. Nếu tracker thiếu qty hoặc Bybit position nhỏ hơn qty tracker, bot sẽ fallback an toàn theo vị thế thực tế.
-
->>>>>>> 78582718eada4d79132653992ba32f60d5dbdc92
+Kiểm tra Railway Volume đã mount vào `/data`.
