@@ -24,12 +24,16 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "recv_window": "5000",
     "openai_api_key": "",
     "openai_model": "gpt-4o-mini",
+<<<<<<< HEAD
+    "allowed_symbols": "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT",
+=======
     "allowed_symbols": "BTCUSDT,ETHUSDT",
+>>>>>>> 78582718eada4d79132653992ba32f60d5dbdc92
     "default_category": "auto",
     "dry_run": True,
-    "max_leverage": 5,
+    "max_leverage": 20,
     "max_margin_per_trade_usdt": "20",
-    "max_notional_usdt": "100",
+    "max_notional_usdt": "300",
     "max_daily_trades": 5,
     "require_tp_sl": True,
     "default_take_profit_pct": "1.2",

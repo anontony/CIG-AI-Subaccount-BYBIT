@@ -29,16 +29,16 @@ class RiskConfig:
     def from_env(cls) -> "RiskConfig":
         allowed = {
             s.strip().upper()
-            for s in os.getenv("ALLOWED_SYMBOLS", "BTCUSDT,ETHUSDT").split(",")
+            for s in os.getenv("ALLOWED_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT").split(",")
             if s.strip()
         }
         return cls(
             allowed_symbols=allowed,
             default_category=os.getenv("DEFAULT_CATEGORY", "auto").strip().lower(),
             dry_run=os.getenv("DRY_RUN", "true").strip().lower() in {"1", "true", "yes", "on"},
-            max_leverage=int(os.getenv("MAX_LEVERAGE", "5")),
+            max_leverage=int(os.getenv("MAX_LEVERAGE", "20")),
             max_margin_per_trade_usdt=Decimal(os.getenv("MAX_MARGIN_PER_TRADE_USDT", "20")),
-            max_notional_usdt=Decimal(os.getenv("MAX_NOTIONAL_USDT", "100")),
+            max_notional_usdt=Decimal(os.getenv("MAX_NOTIONAL_USDT", "300")),
             max_daily_trades=int(os.getenv("MAX_DAILY_TRADES", "5")),
             require_tp_sl=os.getenv("REQUIRE_TP_SL", "true").strip().lower() == "true",
             default_take_profit_pct=Decimal(os.getenv("DEFAULT_TAKE_PROFIT_PCT", "1.2")),
@@ -50,16 +50,16 @@ class RiskConfig:
     def from_settings(cls, settings: Dict[str, Any]) -> "RiskConfig":
         allowed = {
             s.strip().upper()
-            for s in str(settings.get("allowed_symbols") or "BTCUSDT,ETHUSDT").split(",")
+            for s in str(settings.get("allowed_symbols") or "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT").split(",")
             if s.strip()
         }
         return cls(
             allowed_symbols=allowed,
             default_category=str(settings.get("default_category") or "auto").strip().lower(),
             dry_run=bool(settings.get("dry_run", True)),
-            max_leverage=int(settings.get("max_leverage") or 5),
+            max_leverage=int(settings.get("max_leverage") or 20),
             max_margin_per_trade_usdt=Decimal(str(settings.get("max_margin_per_trade_usdt") or "20")),
-            max_notional_usdt=Decimal(str(settings.get("max_notional_usdt") or "100")),
+            max_notional_usdt=Decimal(str(settings.get("max_notional_usdt") or "300")),
             max_daily_trades=int(settings.get("max_daily_trades") or 5),
             require_tp_sl=bool(settings.get("require_tp_sl", True)),
             default_take_profit_pct=Decimal(str(settings.get("default_take_profit_pct") or "1.2")),

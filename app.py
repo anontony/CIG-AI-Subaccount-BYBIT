@@ -4,6 +4,8 @@ import hashlib
 import os
 import time
 import re
+from pathlib import Path
+from dataclasses import asdict
 from decimal import Decimal
 from typing import Any, Dict, Optional
 
@@ -27,11 +29,25 @@ from state import RuntimeManager, UserRuntimeState
 from storage import StoreError, UserStore, mask_secret
 from trade_tracker import OPENING_ACTIONS, CLOSING_ACTIONS, pnl_snapshot, side_from_action
 from strategy_parser import parse_strategy_prompt, summarize_strategy_directives
+from backtest_engine import BacktestConfig, BacktestEngine
 
 load_dotenv()
 
+<<<<<<< HEAD
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
+TEMPLATES_DIR = BASE_DIR / "templates"
+# Railway/Git deploys can sometimes start without bundled asset folders.
+# Create safe fallback folders before mounting StaticFiles so the app never crashes on boot.
+STATIC_DIR.mkdir(parents=True, exist_ok=True)
+TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+
+app = FastAPI(title="CIG AI Subaccount", version="60.0.0")
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+=======
 app = FastAPI(title="CIG AI Subaccount", version="44.0.0")
 app.mount("/static", StaticFiles(directory="static"), name="static")
+>>>>>>> 78582718eada4d79132653992ba32f60d5dbdc92
 store = UserStore()
 runtimes = RuntimeManager(log_store=store)
 
@@ -71,6 +87,29 @@ class SettingsIn(BaseModel):
 
 class CommandIn(BaseModel):
     command: str
+
+
+class BacktestRunIn(BaseModel):
+    symbol: str = "BTCUSDT"
+    category: str = "linear"
+    interval: str = "5"
+    start_time: str
+    end_time: str
+    strategy_prompt: str
+    initial_capital: float = 50.0
+    order_margin_usdt: float = 10.0
+    leverage: int = 10
+    fee_rate: float = 0.0006
+    slippage_rate: float = 0.0002
+    max_trades_per_day: int = 5
+    max_losing_streak_per_day: int = 2
+    default_take_profit_pct: float = 10.0
+    default_stop_loss_pct: float = 5.0
+    confidence_threshold: float = 0.58
+    entry_cooldown_candles: int = 0
+    lookback_candles: int = 220
+    max_ai_candles: int = 500
+    decision_mode: str = "ai_once"
 
 
 
@@ -126,6 +165,109 @@ def allowed_symbols_from_guard(guard: RiskGuard) -> list[str]:
     return sorted(guard.config.allowed_symbols)
 
 
+<<<<<<< HEAD
+def parse_backtest_symbol_list(raw: str, allowed_symbols: list[str]) -> list[str]:
+    """Accept one symbol or a comma/space separated list in Backtest.
+
+    Examples accepted:
+    - BTCUSDT
+    - BTCUSDT,ETHUSDT,SOLUSDT
+    - BTCUSDT ETHUSDT SOLUSDT BNBUSDT XRPUSDT
+
+    This fixes the V56 issue where a pasted allowed-symbols list was treated as
+    one invalid symbol string.
+    """
+    text = str(raw or "").upper().strip()
+    allowed_set = {str(s).upper().strip() for s in (allowed_symbols or []) if str(s).strip()}
+    symbols = []
+    for token in re.findall(r"[A-Z0-9]{2,30}USDT", text):
+        if token not in symbols:
+            symbols.append(token)
+
+    if not symbols and text:
+        # Keep a simple fallback for exact non-USDT markets if the project later allows them.
+        for token in re.split(r"[\s,;|]+", text):
+            token = token.strip().upper()
+            if token and token not in symbols:
+                symbols.append(token)
+
+    if not symbols:
+        symbols = ["BTCUSDT"]
+
+    invalid = [s for s in symbols if allowed_set and s not in allowed_set]
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"Symbol {', '.join(invalid)} chưa nằm trong Allowed Symbols: {', '.join(sorted(allowed_set))}")
+    return symbols
+
+
+def aggregate_backtest_reports(reports: list[Any], symbols: list[str], base_cfg: BacktestConfig, plan_ai_calls: int = 0) -> Dict[str, Any]:
+    if len(reports) == 1:
+        return {
+            "metrics": reports[0].metrics,
+            "trades": reports[0].trades,
+            "logs": reports[0].logs,
+            "config": reports[0].config,
+        }
+
+    trades = []
+    logs = [f"Multi-symbol backtest: {', '.join(symbols)}. Mỗi symbol dùng vốn test riêng {base_cfg.initial_capital} USDT."]
+    for rep in reports:
+        trades.extend(rep.trades)
+        sym = (rep.config or {}).get("symbol", "?")
+        logs.append(f"--- {sym} ---")
+        logs.extend(rep.logs[-80:])
+    trades.sort(key=lambda t: str(t.get("entry_time") or ""))
+
+    wins = [t for t in trades if float(t.get("net_pnl") or 0) > 0]
+    losses = [t for t in trades if float(t.get("net_pnl") or 0) < 0]
+    initial_total = sum(float((r.metrics or {}).get("initial_capital") or base_cfg.initial_capital) for r in reports)
+    final_total = sum(float((r.metrics or {}).get("final_equity") or base_cfg.initial_capital) for r in reports)
+    pnl = final_total - initial_total
+    gross_win = sum(float(t.get("net_pnl") or 0) for t in wins)
+    gross_loss = abs(sum(float(t.get("net_pnl") or 0) for t in losses))
+    max_dd = max(float((r.metrics or {}).get("max_drawdown_pct") or 0) for r in reports) if reports else 0
+    ai_calls = sum(int(float((r.metrics or {}).get("ai_calls") or 0)) for r in reports)
+    waits = sum(int(float((r.metrics or {}).get("wait_count") or 0)) for r in reports)
+    blocked = sum(int(float((r.metrics or {}).get("blocked_count") or 0)) for r in reports)
+
+    metrics = {
+        "initial_capital": round(initial_total, 4),
+        "final_equity": round(final_total, 4),
+        "pnl_usdt": round(pnl, 6),
+        "pnl_pct": round((pnl / initial_total) * 100, 4) if initial_total else 0,
+        "total_trades": len(trades),
+        "win_trades": len(wins),
+        "loss_trades": len(losses),
+        "breakeven_trades": len([t for t in trades if float(t.get("net_pnl") or 0) == 0]),
+        "winrate": round((len(wins) / len(trades)) * 100, 2) if trades else 0,
+        "gross_win_usdt": round(gross_win, 6),
+        "gross_loss_usdt": round(gross_loss, 6),
+        "avg_win_usdt": round(gross_win / len(wins), 6) if wins else 0,
+        "avg_loss_usdt": round(-gross_loss / len(losses), 6) if losses else 0,
+        "profit_factor": round(gross_win / gross_loss, 4) if gross_loss > 0 else None,
+        "max_drawdown_pct": round(max_dd, 4),
+        "ai_calls": ai_calls,
+        "wait_count": waits,
+        "blocked_count": blocked,
+    }
+    first = reports[0].config if reports else asdict(base_cfg)
+    last = reports[-1].config if reports else asdict(base_cfg)
+    config = dict(first or {})
+    config.update({
+        "symbol": " ".join(symbols),
+        "symbols": symbols,
+        "multi_symbol": True,
+        "data_start_time": min(str((r.config or {}).get("data_start_time") or "") for r in reports),
+        "data_end_time": max(str((r.config or {}).get("data_end_time") or "") for r in reports),
+        "processed_start_time": min(str((r.config or {}).get("processed_start_time") or "") for r in reports),
+        "processed_end_time": max(str((r.config or {}).get("processed_end_time") or "") for r in reports),
+        "loaded_candles": sum(int((r.config or {}).get("loaded_candles") or 0) for r in reports),
+    })
+    return {"metrics": metrics, "trades": trades, "logs": logs[-700:], "config": config}
+
+
+=======
+>>>>>>> 78582718eada4d79132653992ba32f60d5dbdc92
 def json_safe(value: Any) -> Any:
     return json.loads(json.dumps(value, ensure_ascii=False, default=str))
 
@@ -210,6 +352,21 @@ def action_label(action: str) -> str:
 
 
 def summarize_trade_result(result: Dict[str, Any]) -> str:
+    if result.get("batch"):
+        rows = result.get("results") or []
+        ok = 0
+        parts = []
+        for r in rows[:5] if isinstance(rows, list) else []:
+            if isinstance(r, dict) and r.get("error"):
+                parts.append("blocked: " + str(r.get("error"))[:80])
+                continue
+            n0 = (r.get("normalized") or {}) if isinstance(r, dict) else {}
+            ex0 = (r.get("execution") or {}) if isinstance(r, dict) else {}
+            act0 = str(n0.get("action") or "").upper()
+            if act0 != "WAIT":
+                ok += 1
+            parts.append(f"{act0} {n0.get('symbol','-')} · {ex0.get('status','-')}")
+        return f"Batch Multi-Symbol · đã xử lý {len(rows) if isinstance(rows, list) else 0} tín hiệu · mở/thử mở {ok} lệnh · " + " | ".join(parts)
     n = result.get("normalized") or {}
     execution = result.get("execution") or {}
     action = str(n.get("action") or "").upper()
@@ -217,7 +374,12 @@ def summarize_trade_result(result: Dict[str, Any]) -> str:
         wait_reason = str(n.get("reason") or execution.get("reason") or "").strip()
         if wait_reason.lower() in {"", "no reason provided", "none", "null", "n/a", "na"}:
             wait_reason = "KHÔNG VÀO LỆNH: chưa có tín hiệu đủ rõ hoặc chưa đủ dữ liệu để tính TP/SL cụ thể."
+<<<<<<< HEAD
+        prefix = "Rule Engine quyết định ĐỨNG NGOÀI" if n.get("_rsi_watch_state_engine") else "AI quyết định ĐỨNG NGOÀI"
+        return prefix + " · " + wait_reason[:260]
+=======
         return "AI quyết định ĐỨNG NGOÀI · " + wait_reason[:220]
+>>>>>>> 78582718eada4d79132653992ba32f60d5dbdc92
     symbol = n.get("symbol") or "-"
     category = str(n.get("category") or "-").upper()
     status = str(execution.get("status") or "-")
@@ -484,6 +646,12 @@ def _apply_prompt_tp_sl_constraints(raw_decision: Dict[str, Any], prompt_meta: D
     """
     decision = dict(raw_decision or {})
     action = str(decision.get("action") or "WAIT").upper().strip()
+<<<<<<< HEAD
+    if action == "BATCH" and isinstance(decision.get("actions"), list):
+        decision["actions"] = [_apply_prompt_tp_sl_constraints(x, prompt_meta) if isinstance(x, dict) else x for x in decision.get("actions") or []]
+        return decision
+=======
+>>>>>>> 78582718eada4d79132653992ba32f60d5dbdc92
     if action in OPENING_ACTIONS and prompt_meta.get("requires_explicit_tp_sl"):
         decision["require_explicit_tp_sl"] = True
         decision["no_default_tp_sl"] = True
@@ -561,6 +729,201 @@ def _has_open_position_same_side(snap: Dict[str, Any], action: str) -> bool:
     return False
 
 
+<<<<<<< HEAD
+def _rsi_watch_state_path(user_id: int, symbol: str = "BTCUSDT") -> Path:
+    safe_symbol = re.sub(r"[^A-Z0-9_\-]", "", str(symbol or "BTCUSDT").upper()) or "BTCUSDT"
+    d = store.runtime_dir / "strategy_state"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"user_{int(user_id)}_{safe_symbol}_rsi5m_watch.json"
+
+
+def _load_rsi_watch_state(user_id: int, symbol: str, prompt_meta: Dict[str, Any]) -> Dict[str, Any]:
+    path = _rsi_watch_state_path(user_id, symbol)
+    prompt_key = hashlib.sha256(json.dumps({
+        "type": "rsi5m_watch",
+        "long": prompt_meta.get("rsi_long_below"),
+        "short": prompt_meta.get("rsi_short_above"),
+        "confirm": prompt_meta.get("candle_confirm_count") or 2,
+        "tf": prompt_meta.get("primary_timeframe") or "5m",
+    }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    base = {
+        "prompt_key": prompt_key,
+        "mode": "NONE",
+        "trigger_rsi": None,
+        "trigger_candle_time": None,
+        "last_processed_candle_time": None,
+        "green_count": 0,
+        "red_count": 0,
+        "updated_at": int(time.time()),
+    }
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or data.get("prompt_key") != prompt_key:
+            return base
+        return {**base, **data}
+    except Exception:
+        return base
+
+
+def _save_rsi_watch_state(user_id: int, symbol: str, state: Dict[str, Any]) -> None:
+    state = dict(state or {})
+    state["updated_at"] = int(time.time())
+    _rsi_watch_state_path(user_id, symbol).write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _extract_recent_candles_chronological(tf_pack: Dict[str, Any]) -> list[Dict[str, Any]]:
+    candles = []
+    kl = tf_pack.get("klines") if isinstance(tf_pack, dict) else {}
+    raw = (kl or {}).get("recent_candles") if isinstance(kl, dict) else None
+    if raw is None:
+        raw = tf_pack.get("recent_candles") if isinstance(tf_pack, dict) else []
+    if not isinstance(raw, list):
+        return []
+    for c in raw:
+        if not isinstance(c, dict):
+            continue
+        try:
+            t = int(c.get("t"))
+        except Exception:
+            continue
+        color = str(c.get("color") or "").lower().strip()
+        if color not in {"green", "red", "doji"}:
+            try:
+                o = Decimal(str(c.get("o")))
+                close = Decimal(str(c.get("c")))
+                color = "green" if close > o else "red" if close < o else "doji"
+            except Exception:
+                color = "doji"
+        candles.append({**c, "t": t, "color": color})
+    candles.sort(key=lambda x: int(x.get("t") or 0))
+    return candles
+
+
+def _rsi_watch_base_order(prompt_meta: Dict[str, Any], symbol: str) -> Dict[str, Any]:
+    return {
+        "category": "linear",
+        "symbol": symbol or "BTCUSDT",
+        "leverage": int(prompt_meta.get("leverage") or 20),
+        "entry_type": "market",
+        "margin_usdt": prompt_meta.get("futures_margin_usdt") or 10,
+        "risk_usdt": prompt_meta.get("risk_usdt") or 1,
+        "take_profit_pct": prompt_meta.get("take_profit_pct"),
+        "stop_loss_pct": prompt_meta.get("stop_loss_pct"),
+        "tp_sl_mode": prompt_meta.get("tp_sl_mode") or "pnl_percent",
+        "_deterministic_exact_prompt": True,
+        "_rsi_watch_state_engine": True,
+    }
+
+
+def _iter_rsi_watch_symbol_snaps(ai_snapshot: Dict[str, Any], prompt_meta: Dict[str, Any]) -> list[Dict[str, Any]]:
+    """Return linear symbol snapshots in the order the prompt/user allowed them.
+
+    V54: exact RSI 5m watch strategies are multi-symbol capable. We scan every
+    linear symbol present in the compact snapshot, not just BTCUSDT. Spot snapshots
+    are ignored because this strategy is for Perpetual Futures.
+    """
+    symbols = ai_snapshot.get("symbols") if isinstance(ai_snapshot, dict) else {}
+    if not isinstance(symbols, dict):
+        return []
+    requested = [str(s).upper().strip() for s in (prompt_meta.get("symbols") or []) if str(s).strip()]
+    # Keep deterministic ordering: prompt symbol order first, then remaining linear symbols alphabetically.
+    rows: list[tuple[str, Dict[str, Any]]] = []
+    for key, snap in symbols.items():
+        if not isinstance(snap, dict):
+            continue
+        cat = str(snap.get("category") or "").lower().strip()
+        sym = str(snap.get("symbol") or "").upper().strip()
+        if cat != "linear" or not sym:
+            continue
+        if requested and sym not in requested:
+            continue
+        rows.append((sym, snap))
+    rank = {s: i for i, s in enumerate(requested)}
+    rows.sort(key=lambda item: (rank.get(item[0], 10_000), item[0]))
+    return [snap for _, snap in rows]
+
+
+def _rsi_watch_colors_text(colors: Any) -> str:
+    """Readable candle color formatter for live logs.
+
+    Avoid Python-list repr like ['green', 'red'] because the UI may cut it and
+    make it look like only one candle was checked.
+    """
+    if not isinstance(colors, list):
+        return "-"
+    cleaned = [str(c or "?").strip() for c in colors if str(c or "").strip()]
+    return ",".join(cleaned) if cleaned else "-"
+
+
+def _rsi_watch_status(
+    symbol: str,
+    rsi5: Any,
+    mode: str,
+    latest_color: str,
+    colors: list[str] | None,
+    prompt_meta: Dict[str, Any],
+    state: Dict[str, Any] | None = None,
+    note: str = "",
+) -> Dict[str, Any]:
+    state = state or {}
+    n = int(prompt_meta.get("candle_confirm_count") or 2)
+    return {
+        "symbol": str(symbol or "-").upper(),
+        "rsi5": rsi5,
+        "mode": str(mode or "NONE").upper(),
+        "latest_color": str(latest_color or "-"),
+        "last_3_candles": list(colors or []),
+        "long_threshold": prompt_meta.get("rsi_long_below"),
+        "short_threshold": prompt_meta.get("rsi_short_above"),
+        "green_count": int(state.get("green_count") or 0),
+        "red_count": int(state.get("red_count") or 0),
+        "required_count": n,
+        "note": str(note or ""),
+    }
+
+
+def _rsi_watch_status_text(st: Dict[str, Any]) -> str:
+    symbol = str(st.get("symbol") or "-").upper()
+    rsi = st.get("rsi5")
+    try:
+        rsi_txt = f"{float(rsi):.2f}"
+    except Exception:
+        rsi_txt = "-"
+    mode = str(st.get("mode") or "NONE").upper()
+    colors = _rsi_watch_colors_text(st.get("last_3_candles") or [])
+    latest = str(st.get("latest_color") or "-")
+    long_th = st.get("long_threshold")
+    short_th = st.get("short_threshold")
+    req = int(st.get("required_count") or 2)
+    green_count = int(st.get("green_count") or 0)
+    red_count = int(st.get("red_count") or 0)
+    note = str(st.get("note") or "").strip()
+    if mode == "LONG_WATCH":
+        progress = f"green {green_count}/{req}"
+    elif mode == "SHORT_WATCH":
+        progress = f"red {red_count}/{req}"
+    else:
+        progress = f"trigger LONG<{long_th} / SHORT>{short_th}"
+    out = f"{symbol}: RSI5={rsi_txt} · watch={mode} · nến gần nhất={latest} · 3 nến={colors} · {progress}"
+    if note:
+        out += f" · {note}"
+    return out
+
+
+def _rsi_watch_multi_status_text(statuses: list[Dict[str, Any]], max_items: int = 8) -> str:
+    if not statuses:
+        return "không có trạng thái symbol."
+    shown = statuses[:max_items]
+    text = " | ".join(_rsi_watch_status_text(st) for st in shown)
+    if len(statuses) > len(shown):
+        text += f" | +{len(statuses)-len(shown)} cặp khác"
+    return text
+
+
+def _evaluate_exact_rsi_candle_symbol(user_id: int, prompt_meta: Dict[str, Any], snap: Dict[str, Any]) -> Dict[str, Any]:
+    """Evaluate one symbol for the stateful RSI 5m watch strategy."""
+    symbol = str(snap.get("symbol") or "BTCUSDT").upper().strip()
+=======
 def _evaluate_exact_rsi_candle_prompt(prompt_meta: Dict[str, Any], ai_snapshot: Dict[str, Any]) -> Dict[str, Any]:
     """Deterministic evaluator for prompts that explicitly define RSI 5m + candle rules.
 
@@ -569,20 +932,256 @@ def _evaluate_exact_rsi_candle_prompt(prompt_meta: Dict[str, Any], ai_snapshot: 
     """
     snap = _first_symbol_snapshot(ai_snapshot, "linear:BTCUSDT")
     symbol = snap.get("symbol") or "BTCUSDT"
+>>>>>>> 78582718eada4d79132653992ba32f60d5dbdc92
     tfs = snap.get("timeframes") if isinstance(snap.get("timeframes"), dict) else {}
     tf5 = tfs.get("5m") if isinstance(tfs, dict) else {}
     if not isinstance(tf5, dict) or tf5.get("error"):
         return {
             "action": "WAIT", "category": "linear", "symbol": symbol, "confidence": 0,
+<<<<<<< HEAD
+            "reason": "KHÔNG VÀO LỆNH: thiếu dữ liệu 5m hợp lệ nên không thể chạy RSI Watch State Engine. Bot không dùng H1/H4/D1 thay thế.",
+            "_deterministic_exact_prompt": True, "_rsi_watch_state_engine": True,
+        }
+
+    ind = tf5.get("indicators") if isinstance(tf5.get("indicators"), dict) else {}
+=======
             "reason": f"KHÔNG VÀO LỆNH: 1) thiếu dữ liệu 5m hợp lệ nên không kiểm tra được RSI 5m; 2) chiến lược này chỉ cho phép RSI 5m + 2 nến xác nhận, không dùng H1/H4/D1 để tự mở lệnh.",
             "_deterministic_exact_prompt": True,
         }
     ind = tf5.get("indicators") if isinstance(tf5.get("indicators"), dict) else {}
     rsi5 = None
+>>>>>>> 78582718eada4d79132653992ba32f60d5dbdc92
     try:
         rsi5 = float(ind.get("rsi14")) if ind.get("rsi14") is not None else None
     except Exception:
         rsi5 = None
+<<<<<<< HEAD
+    if rsi5 is None:
+        return {
+            "action": "WAIT", "category": "linear", "symbol": symbol, "confidence": 0,
+            "reason": "KHÔNG VÀO LỆNH: snapshot có 5m nhưng thiếu RSI14 5m. Không dùng chỉ báo khác thay thế vì prompt chỉ định RSI 5m.",
+            "_deterministic_exact_prompt": True, "_rsi_watch_state_engine": True,
+        }
+
+    candles = _extract_recent_candles_chronological(tf5)
+    if not candles:
+        return {
+            "action": "WAIT", "category": "linear", "symbol": symbol, "confidence": 0,
+            "reason": f"KHÔNG VÀO LỆNH: có RSI 5m={rsi5:.2f} nhưng thiếu danh sách nến 5m đã đóng để đếm xác nhận.",
+            "_deterministic_exact_prompt": True, "_rsi_watch_state_engine": True,
+        }
+
+    latest = candles[-1]
+    latest_t = int(latest.get("t") or 0)
+    latest_color = str(latest.get("color") or "doji")
+    long_threshold = prompt_meta.get("rsi_long_below")
+    short_threshold = prompt_meta.get("rsi_short_above")
+    n = int(prompt_meta.get("candle_confirm_count") or 2)
+    state = _load_rsi_watch_state(user_id, symbol, prompt_meta)
+
+    base_order = _rsi_watch_base_order(prompt_meta, symbol)
+
+    mode = str(state.get("mode") or "NONE").upper()
+    last_processed = int(state.get("last_processed_candle_time") or 0)
+
+    # Start watch state only from the latest closed candle with the RSI trigger.
+    if mode not in {"LONG_WATCH", "SHORT_WATCH"}:
+        if long_threshold is not None and rsi5 < float(long_threshold):
+            state.update({
+                "mode": "LONG_WATCH",
+                "trigger_rsi": rsi5,
+                "trigger_candle_time": latest_t,
+                "last_processed_candle_time": latest_t,
+                "green_count": 0,
+                "red_count": 0,
+            })
+            _save_rsi_watch_state(user_id, symbol, state)
+            status = _rsi_watch_status(symbol, rsi5, "LONG_WATCH", latest_color, [str(c.get("color") or "?") for c in candles[-3:]], prompt_meta, state, "vừa bật LONG_WATCH")
+            return {
+                "action": "WAIT", "category": "linear", "symbol": symbol, "confidence": 0,
+                "reason": f"LONG_WATCH đã bật: RSI 5m={rsi5:.2f} < {float(long_threshold):g}. Bắt đầu đếm 2 nến 5m tiếp theo; nến kích hoạt không được tính là nến xác nhận.",
+                "_deterministic_exact_prompt": True, "_rsi_watch_state_engine": True,
+                "_rsi_watch_status": status,
+            }
+        if short_threshold is not None and rsi5 > float(short_threshold):
+            state.update({
+                "mode": "SHORT_WATCH",
+                "trigger_rsi": rsi5,
+                "trigger_candle_time": latest_t,
+                "last_processed_candle_time": latest_t,
+                "green_count": 0,
+                "red_count": 0,
+            })
+            _save_rsi_watch_state(user_id, symbol, state)
+            status = _rsi_watch_status(symbol, rsi5, "SHORT_WATCH", latest_color, [str(c.get("color") or "?") for c in candles[-3:]], prompt_meta, state, "vừa bật SHORT_WATCH")
+            return {
+                "action": "WAIT", "category": "linear", "symbol": symbol, "confidence": 0,
+                "reason": f"SHORT_WATCH đã bật: RSI 5m={rsi5:.2f} > {float(short_threshold):g}. Bắt đầu đếm 2 nến 5m tiếp theo; nến kích hoạt không được tính là nến xác nhận.",
+                "_deterministic_exact_prompt": True, "_rsi_watch_state_engine": True,
+                "_rsi_watch_status": status,
+            }
+        colors = [str(c.get("color") or "?") for c in candles[-3:]]
+        status = _rsi_watch_status(symbol, rsi5, "NONE", latest_color, colors, prompt_meta, state, "chưa chạm vùng RSI trigger")
+        return {
+            "action": "WAIT", "category": "linear", "symbol": symbol, "confidence": 0,
+            "reason": f"Chưa bật watch: RSI 5m={rsi5:.2f}, cần < {long_threshold} để LONG_WATCH hoặc > {short_threshold} để SHORT_WATCH. Nến gần nhất={latest_color}, 3 nến mới={_rsi_watch_colors_text(colors)}.",
+            "_deterministic_exact_prompt": True, "_rsi_watch_state_engine": True,
+            "_rsi_watch_status": status,
+        }
+
+    # Process only candles that closed after the trigger / last processed candle.
+    new_candles = [c for c in candles if int(c.get("t") or 0) > last_processed]
+    if not new_candles:
+        status = _rsi_watch_status(symbol, rsi5, mode, latest_color, [str(c.get("color") or "?") for c in candles[-3:]], prompt_meta, state, "chưa có nến mới sau trigger")
+        return {
+            "action": "WAIT", "category": "linear", "symbol": symbol, "confidence": 0,
+            "reason": f"Đang {mode}: chưa có nến 5m mới đã đóng sau nến kích hoạt. green_count={state.get('green_count',0)}, red_count={state.get('red_count',0)}.",
+            "_deterministic_exact_prompt": True, "_rsi_watch_state_engine": True,
+            "_rsi_watch_status": status,
+        }
+
+    processed_colors: list[str] = []
+    for c in new_candles:
+        color = str(c.get("color") or "doji")
+        processed_colors.append(color)
+        state["last_processed_candle_time"] = int(c.get("t") or 0)
+        if mode == "LONG_WATCH":
+            if color == "green":
+                state["green_count"] = int(state.get("green_count") or 0) + 1
+                state["red_count"] = 0
+                if int(state.get("green_count") or 0) >= n:
+                    if _has_open_position_same_side(snap, "OPEN_LONG"):
+                        state.update({"mode": "NONE", "green_count": 0, "red_count": 0})
+                        _save_rsi_watch_state(user_id, symbol, state)
+                        return {
+                            "action": "WAIT", "category": "linear", "symbol": symbol, "confidence": 0,
+                            "reason": f"LONG_WATCH đủ {n} nến xanh sau RSI trigger nhưng đã có vị thế Long/Buy cùng chiều nên không mở trùng lệnh.",
+                            "_deterministic_exact_prompt": True, "_rsi_watch_state_engine": True,
+                        }
+                    state.update({"mode": "NONE", "green_count": 0, "red_count": 0})
+                    _save_rsi_watch_state(user_id, symbol, state)
+                    return {
+                        **base_order,
+                        "action": "OPEN_LONG",
+                        "confidence": 100,
+                        "reason": f"Đúng stateful rule: {symbol} RSI 5m đã kích hoạt LONG_WATCH tại {float(state.get('trigger_rsi') or 0):.2f}; sau đó có {n} nến 5m xanh liên tiếp ({processed_colors}).",
+                    }
+            else:
+                state.update({"mode": "NONE", "green_count": 0, "red_count": 0})
+                _save_rsi_watch_state(user_id, symbol, state)
+                return {
+                    "action": "WAIT", "category": "linear", "symbol": symbol, "confidence": 0,
+                    "reason": f"Hủy LONG_WATCH: nến xác nhận bị đứt chuỗi vì xuất hiện nến {color} sau trigger. Processed={processed_colors}.",
+                    "_deterministic_exact_prompt": True, "_rsi_watch_state_engine": True,
+                }
+        if mode == "SHORT_WATCH":
+            if color == "red":
+                state["red_count"] = int(state.get("red_count") or 0) + 1
+                state["green_count"] = 0
+                if int(state.get("red_count") or 0) >= n:
+                    if _has_open_position_same_side(snap, "OPEN_SHORT"):
+                        state.update({"mode": "NONE", "green_count": 0, "red_count": 0})
+                        _save_rsi_watch_state(user_id, symbol, state)
+                        return {
+                            "action": "WAIT", "category": "linear", "symbol": symbol, "confidence": 0,
+                            "reason": f"SHORT_WATCH đủ {n} nến đỏ sau RSI trigger nhưng đã có vị thế Short/Sell cùng chiều nên không mở trùng lệnh.",
+                            "_deterministic_exact_prompt": True, "_rsi_watch_state_engine": True,
+                        }
+                    state.update({"mode": "NONE", "green_count": 0, "red_count": 0})
+                    _save_rsi_watch_state(user_id, symbol, state)
+                    return {
+                        **base_order,
+                        "action": "OPEN_SHORT",
+                        "confidence": 100,
+                        "reason": f"Đúng stateful rule: {symbol} RSI 5m đã kích hoạt SHORT_WATCH tại {float(state.get('trigger_rsi') or 0):.2f}; sau đó có {n} nến 5m đỏ liên tiếp ({processed_colors}).",
+                    }
+            else:
+                state.update({"mode": "NONE", "green_count": 0, "red_count": 0})
+                _save_rsi_watch_state(user_id, symbol, state)
+                return {
+                    "action": "WAIT", "category": "linear", "symbol": symbol, "confidence": 0,
+                    "reason": f"Hủy SHORT_WATCH: nến xác nhận bị đứt chuỗi vì xuất hiện nến {color} sau trigger. Processed={processed_colors}.",
+                    "_deterministic_exact_prompt": True, "_rsi_watch_state_engine": True,
+                }
+
+    _save_rsi_watch_state(user_id, symbol, state)
+    if mode == "LONG_WATCH":
+        status = _rsi_watch_status(symbol, rsi5, mode, latest_color, [str(c.get("color") or "?") for c in candles[-3:]], prompt_meta, state, f"processed={_rsi_watch_colors_text(processed_colors)}")
+        return {
+            "action": "WAIT", "category": "linear", "symbol": symbol, "confidence": 0,
+            "reason": f"Đang LONG_WATCH: đã có {int(state.get('green_count') or 0)}/{n} nến xanh xác nhận sau trigger. Processed={_rsi_watch_colors_text(processed_colors)}.",
+            "_deterministic_exact_prompt": True, "_rsi_watch_state_engine": True,
+            "_rsi_watch_status": status,
+        }
+    status = _rsi_watch_status(symbol, rsi5, mode, latest_color, [str(c.get("color") or "?") for c in candles[-3:]], prompt_meta, state, f"processed={_rsi_watch_colors_text(processed_colors)}")
+    return {
+        "action": "WAIT", "category": "linear", "symbol": symbol, "confidence": 0,
+        "reason": f"Đang SHORT_WATCH: đã có {int(state.get('red_count') or 0)}/{n} nến đỏ xác nhận sau trigger. Processed={_rsi_watch_colors_text(processed_colors)}.",
+        "_deterministic_exact_prompt": True, "_rsi_watch_state_engine": True,
+        "_rsi_watch_status": status,
+    }
+
+
+def _evaluate_exact_rsi_candle_prompt(user_id: int, prompt_meta: Dict[str, Any], ai_snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """Multi-symbol stateful evaluator for RSI 5m watch prompts.
+
+    V54 scans every allowed linear symbol in the snapshot, keeps separate
+    LONG_WATCH/SHORT_WATCH state files per symbol, and can return a BATCH of
+    opening actions when multiple symbols finish confirmation in the same scan.
+    """
+    snaps = _iter_rsi_watch_symbol_snaps(ai_snapshot, prompt_meta)
+    if not snaps:
+        return {
+            "action": "WAIT", "category": "linear", "symbol": "MULTI", "confidence": 0,
+            "reason": "KHÔNG VÀO LỆNH: không có snapshot linear nào cho danh sách allowed_symbols. Hãy thêm BTCUSDT, ETHUSDT, SOLUSDT... vào Allowed Symbols.",
+            "_deterministic_exact_prompt": True, "_rsi_watch_state_engine": True,
+        }
+    decisions: list[Dict[str, Any]] = []
+    waits: list[Dict[str, Any]] = []
+    for snap in snaps:
+        d = _evaluate_exact_rsi_candle_symbol(user_id, prompt_meta, snap)
+        if str(d.get("action") or "").upper() in OPENING_ACTIONS:
+            decisions.append(d)
+        else:
+            waits.append(d)
+    if decisions:
+        max_batch = int(prompt_meta.get("max_batch_orders") or 3)
+        selected = decisions[:max(1, max_batch)]
+        if len(selected) == 1:
+            return selected[0]
+        return {
+            "action": "BATCH",
+            "category": "linear",
+            "symbol": "MULTI",
+            "actions": selected,
+            "confidence": 100,
+            "reason": "Multi-symbol RSI Watch: " + "; ".join(f"{x.get('symbol')} {x.get('action')}" for x in selected),
+            "_deterministic_exact_prompt": True,
+            "_rsi_watch_state_engine": True,
+            "_rsi_watch_batch": True,
+        }
+    # No trade: keep structured per-symbol status for clean one-line live logs.
+    statuses = []
+    for d in waits:
+        st = d.get("_rsi_watch_status") if isinstance(d, dict) else None
+        if isinstance(st, dict):
+            statuses.append(st)
+        elif isinstance(d, dict):
+            statuses.append({"symbol": d.get("symbol"), "note": str(d.get("reason") or "")})
+    return {
+        "action": "WAIT",
+        "category": "linear",
+        "symbol": "MULTI" if len(snaps) > 1 else (snaps[0].get("symbol") or "BTCUSDT"),
+        "confidence": 0,
+        "reason": "Chưa có cặp nào đủ điều kiện RSI 5m + 2 nến xác nhận.",
+        "_deterministic_exact_prompt": True,
+        "_rsi_watch_state_engine": True,
+        "_rsi_watch_multi": True,
+        "_rsi_watch_statuses": statuses,
+    }
+
+
+=======
     colors = _last_candle_colors(tf5, int(prompt_meta.get("candle_confirm_count") or 2))
     if rsi5 is None:
         return {
@@ -643,6 +1242,7 @@ def _evaluate_exact_rsi_candle_prompt(prompt_meta: Dict[str, Any], ai_snapshot: 
         "_deterministic_exact_prompt": True,
     }
 
+>>>>>>> 78582718eada4d79132653992ba32f60d5dbdc92
 def _is_simple_dca_or_direct_prompt(prompt: str, meta: Dict[str, Any]) -> bool:
     """Return True only for deterministic execution prompts safe to run without AI.
 
@@ -865,10 +1465,24 @@ async def build_market_snapshot(client: BybitClient, symbol: str, category: str,
 
 async def build_snapshots_for_guard(client: BybitClient, guard: RiskGuard, prompt_meta: Dict[str, Any] | None = None) -> Dict[str, Any]:
     snapshots: Dict[str, Any] = {}
-    for category in categories_for_guard(guard):
-        for symbol in allowed_symbols_from_guard(guard):
+    prompt_meta = prompt_meta or {}
+    # V54: exact RSI Watch futures strategies should scan only linear futures.
+    # Avoid wasting calls on Spot and avoid giving a futures strategy irrelevant data.
+    if _is_exact_rsi_candle_prompt(prompt_meta) or str(prompt_meta.get("market") or "").lower() == "linear":
+        categories = ["linear"]
+    elif str(prompt_meta.get("market") or "").lower() == "spot":
+        categories = ["spot"]
+    else:
+        categories = categories_for_guard(guard)
+    requested_symbols = [str(s).upper().strip() for s in (prompt_meta.get("symbols") or []) if str(s).strip()]
+    guard_symbols = allowed_symbols_from_guard(guard)
+    symbols = [s for s in (requested_symbols or guard_symbols) if s in guard_symbols]
+    if not symbols:
+        symbols = guard_symbols
+    for category in categories:
+        for symbol in symbols:
             try:
-                snapshots[snapshot_key(category, symbol)] = await build_market_snapshot(client, symbol, category)
+                snapshots[snapshot_key(category, symbol)] = await build_market_snapshot(client, symbol, category, prompt_meta)
             except Exception as exc:
                 # Do not kill the entire loop if one market type is unsupported for a symbol.
                 snapshots[snapshot_key(category, symbol)] = {
@@ -973,6 +1587,25 @@ def _market_snapshot_brief(ai_snapshot: Dict[str, Any]) -> str:
     symbols = ai_snapshot.get("symbols") if isinstance(ai_snapshot, dict) else None
     if not isinstance(symbols, dict) or not symbols:
         return "Dữ liệu thị trường: trống hoặc không hợp lệ."
+<<<<<<< HEAD
+    prompt_only_count = sum(1 for s in symbols.values() if isinstance(s, dict) and s.get("prompt_only_mode"))
+    linear_rows = []
+    for key, snap in symbols.items():
+        if not isinstance(snap, dict):
+            continue
+        if str(snap.get("category") or "").lower() != "linear":
+            continue
+        linear_rows.append((str(snap.get("symbol") or key), snap))
+    if prompt_only_count and len(linear_rows) > 1:
+        rows = []
+        for sym, snap in linear_rows[:6]:
+            price = _fmt_num(snap.get("price"), 2)
+            tfs = snap.get("timeframes") or {}
+            rows.append(f"{sym} giá {price} · 5M: {_tf_brief(tfs.get('5m') or {})}")
+        more = f" · +{len(linear_rows)-6} cặp" if len(linear_rows) > 6 else ""
+        return "Market MULTI LINEAR · " + " | ".join(rows) + more
+=======
+>>>>>>> 78582718eada4d79132653992ba32f60d5dbdc92
     preferred_key = None
     for key in symbols:
         if str(key).lower() == "linear:btcusdt":
@@ -1000,15 +1633,52 @@ def _raw_ai_brief(decision: Dict[str, Any]) -> str:
     action = str(decision.get("action") or "WAIT").upper()
     symbol = decision.get("symbol") or "BTCUSDT"
     reason = str(decision.get("reason") or "").strip()
+<<<<<<< HEAD
+
+    # Prompt-only deterministic strategies should be logged as Rule Engine, not AI.
+    if decision.get("_rsi_watch_state_engine"):
+        if action == "BATCH":
+            actions = decision.get("actions") if isinstance(decision.get("actions"), list) else []
+            details = ", ".join(f"{str(x.get('action') or '').upper()} {x.get('symbol')}" for x in actions[:8] if isinstance(x, dict))
+            return f"Rule Engine: BATCH MULTI · {len(actions)} tín hiệu · {details} · {reason[:220]}"
+        if action in {"WAIT", "HOLD", "NO_TRADE"}:
+            statuses = decision.get("_rsi_watch_statuses") if isinstance(decision.get("_rsi_watch_statuses"), list) else []
+            if statuses:
+                return "Rule Engine: WAIT MULTI · " + (reason or "Chưa có cặp nào đủ điều kiện RSI 5m + 2 nến xác nhận.") + " · " + _rsi_watch_multi_status_text(statuses)
+            st = decision.get("_rsi_watch_status") if isinstance(decision.get("_rsi_watch_status"), dict) else None
+            if st:
+                return f"Rule Engine: WAIT {symbol} · " + _rsi_watch_status_text(st)
+            return f"Rule Engine: WAIT {symbol} · {reason or 'chưa có setup đủ rõ.'}"
+        pieces = [f"Rule Engine: {action} {symbol}"]
+    else:
+        if action == "BATCH":
+            actions = decision.get("actions") if isinstance(decision.get("actions"), list) else []
+            details = ", ".join(f"{str(x.get('action') or '').upper()} {x.get('symbol')}" for x in actions[:6] if isinstance(x, dict))
+            return f"AI: BATCH MULTI · {len(actions)} tín hiệu · {details} · {reason[:180]}"
+        if action in {"WAIT", "HOLD", "NO_TRADE"}:
+            return f"AI: WAIT {symbol} · {reason[:260] if reason else 'chưa có setup đủ rõ.'}"
+        pieces = [f"AI: {action} {symbol}"]
+
+=======
     if action in {"WAIT", "HOLD", "NO_TRADE"}:
         return f"AI: WAIT {symbol} · {reason[:260] if reason else 'chưa có setup đủ rõ.'}"
     pieces = [f"AI: {action} {symbol}"]
+>>>>>>> 78582718eada4d79132653992ba32f60d5dbdc92
     if decision.get("leverage"):
         pieces.append(f"lev {decision.get('leverage')}x")
     if decision.get("margin_usdt"):
         pieces.append(f"margin {decision.get('margin_usdt')} USDT")
     if decision.get("risk_usdt"):
         pieces.append(f"risk {decision.get('risk_usdt')} USDT")
+<<<<<<< HEAD
+    if decision.get("take_profit_pct"):
+        pieces.append(f"TP {decision.get('take_profit_pct')}% PNL")
+    if decision.get("stop_loss_pct"):
+        pieces.append(f"SL {decision.get('stop_loss_pct')}% PNL")
+    if decision.get("move_sl_when_pnl_pct") and decision.get("move_sl_to_pnl_pct"):
+        pieces.append(f"dời SL: PNL>={decision.get('move_sl_when_pnl_pct')}% → khóa {decision.get('move_sl_to_pnl_pct')}%")
+=======
+>>>>>>> 78582718eada4d79132653992ba32f60d5dbdc92
     if decision.get("stop_loss"):
         pieces.append(f"SL {_short_number(decision.get('stop_loss'))}")
     if decision.get("take_profit"):
@@ -1016,7 +1686,11 @@ def _raw_ai_brief(decision: Dict[str, Any]) -> str:
     if decision.get("confidence") is not None:
         pieces.append(f"conf {decision.get('confidence')}")
     if reason:
+<<<<<<< HEAD
+        pieces.append("lý do: " + reason[:260])
+=======
         pieces.append("lý do: " + reason[:220])
+>>>>>>> 78582718eada4d79132653992ba32f60d5dbdc92
     return " · ".join(pieces)
 
 
@@ -1355,14 +2029,37 @@ async def analyze_and_execute(
     if not allowed_symbols:
         raise RiskError("allowed_symbols đang rỗng.")
 
-    if str(raw_decision.get("action", "WAIT")).upper().strip() in {"WAIT", "HOLD", "NO_TRADE"}:
+    action_name = str(raw_decision.get("action", "WAIT")).upper().strip()
+    if action_name == "BATCH":
+        actions = raw_decision.get("actions") if isinstance(raw_decision.get("actions"), list) else []
+        batch_results: list[Dict[str, Any]] = []
+        for item in actions:
+            if not isinstance(item, dict):
+                continue
+            try:
+                r = await analyze_and_execute(
+                    user_id=user_id,
+                    runtime=runtime,
+                    settings=settings,
+                    raw_decision=item,
+                    snapshots=snapshots,
+                )
+                batch_results.append(r)
+            except (RiskError, BybitAPIError) as exc:
+                batch_results.append({
+                    "error": str(exc),
+                    "normalized": {"action": "WAIT", "symbol": item.get("symbol"), "reason": str(exc)},
+                    "execution": {"status": "blocked", "reason": str(exc)},
+                })
+        return {"batch": True, "results": batch_results, "risk": guard.public_config()}
+
+    if action_name in {"WAIT", "HOLD", "NO_TRADE"}:
         normalized = guard.normalize_action(raw_decision, market_price=Decimal("1"), qty_step=Decimal("0.001"), min_qty=Decimal("0.001"), daily_trade_count=runtime.daily_trade_count)
         result = await execute_action(client, guard, normalized)
         return {"normalized": normalized, "execution": result, "risk": guard.public_config()}
 
     decision_symbol = str(raw_decision.get("symbol") or allowed_symbols[0]).upper().strip()
     decision_category = guard.resolve_category(raw_decision)
-    action_name = str(raw_decision.get("action", "WAIT")).upper().strip()
     if decision_symbol not in allowed_symbols and action_name not in {"WAIT", "HOLD", "NO_TRADE"}:
         raise RiskError(f"AI chọn symbol ngoài allowed list: {decision_symbol}")
 
@@ -1466,10 +2163,17 @@ async def bot_loop_safe(user_id: int, stop_event: asyncio.Event) -> None:
             has_indicator_condition = bool(prompt_meta.get("rsi_rules") or prompt_meta.get("indicators"))
             ai_snapshot = {"symbols": _compact_snapshot_for_ai(snapshots, prompt_meta)}
             if _is_exact_rsi_candle_prompt(prompt_meta):
+<<<<<<< HEAD
+                raw_decision = _evaluate_exact_rsi_candle_prompt(user_id, prompt_meta, ai_snapshot)
+                await _log_ai_result(runtime, settings, ai_snapshot, raw_decision)
+                await runtime.log("INFO", "Rule Engine đã xử lý đúng prompt gốc: RSI 5m + nến 5m. Không gọi AI để tránh tự biên chiến lược khác.")
+                await runtime.log("INFO", "Rule Engine đã xử lý xong.")
+=======
                 raw_decision = _evaluate_exact_rsi_candle_prompt(prompt_meta, ai_snapshot)
                 await _log_ai_result(runtime, settings, ai_snapshot, raw_decision)
                 await runtime.log("INFO", "Đã xử lý bằng rule engine đúng prompt gốc: RSI 5m + nến 5m. Không gọi AI để tránh tự biên chiến lược khác.")
                 await runtime.log("INFO", "AI đã phân tích xong.")
+>>>>>>> 78582718eada4d79132653992ba32f60d5dbdc92
             elif use_cost_saver and fallback and not has_indicator_condition:
                 raw_decision = fallback
                 await runtime.log("INFO", "Tiết kiệm token: prompt DCA/lệnh rõ ràng được parser xử lý, không gọi AI vòng này.")
@@ -1562,10 +2266,17 @@ async def run_saved_prompt_once(user_id: int) -> Dict[str, Any]:
     has_indicator_condition = bool(prompt_meta.get("rsi_rules") or prompt_meta.get("indicators"))
     ai_snapshot = {"symbols": _compact_snapshot_for_ai(snapshots, prompt_meta)}
     if _is_exact_rsi_candle_prompt(prompt_meta):
+<<<<<<< HEAD
+        raw_decision = _evaluate_exact_rsi_candle_prompt(user_id, prompt_meta, ai_snapshot)
+        await _log_ai_result(runtime, settings, ai_snapshot, raw_decision)
+        await runtime.log("INFO", "Rule Engine đã xử lý đúng prompt gốc: RSI 5m + nến 5m. Không gọi AI để tránh tự biên chiến lược khác.")
+        await runtime.log("INFO", "Rule Engine đã xử lý xong.")
+=======
         raw_decision = _evaluate_exact_rsi_candle_prompt(prompt_meta, ai_snapshot)
         await _log_ai_result(runtime, settings, ai_snapshot, raw_decision)
         await runtime.log("INFO", "Đã xử lý bằng rule engine đúng prompt gốc: RSI 5m + nến 5m. Không gọi AI để tránh tự biên chiến lược khác.")
         await runtime.log("INFO", "AI đã phân tích xong.")
+>>>>>>> 78582718eada4d79132653992ba32f60d5dbdc92
     elif use_cost_saver and fallback and not has_indicator_condition:
         raw_decision = fallback
         await runtime.log("INFO", "Tiết kiệm token: prompt rõ ràng được parser xử lý, không gọi AI lần này.")
@@ -1601,10 +2312,468 @@ async def run_saved_prompt_once(user_id: int) -> Dict[str, Any]:
     return json_safe({"ok": True, "ai_decision": raw_decision, "result": result, "summary": summarize_trade_result(result), "prompt_meta": prompt_meta})
 
 
+
+
+
+def _fallback_backtest_plan_from_meta(prompt_meta: Dict[str, Any], cfg: BacktestConfig) -> Dict[str, Any]:
+    """Build a deterministic plan from the local strategy parser.
+
+    V58 adds a high-winrate profile when the prompt explicitly asks for
+    `winrate cao` / `high winrate`. The profile is conservative: fewer trades,
+    stronger trend filters, RSI reclaim/reject, ATR/volume filters and cooldown.
+    """
+    prompt_text = _strip_for_prompt_match(getattr(cfg, "strategy_prompt", ""))
+    high_wr = any(k in prompt_text for k in ["winrate cao", "high winrate", "ti le thang cao", "ty le thang cao", "uu tien winrate", "ưu tiên winrate"])
+
+    plan: Dict[str, Any] = {
+        "source": "local_parser_high_winrate" if high_wr else "local_parser",
+        "mode": "deterministic_backtest_plan",
+        "timeframe": cfg.interval,
+        "confirm_candles": int(prompt_meta.get("candle_confirm_count") or (3 if high_wr else 2)),
+        "confidence": 88 if high_wr else 80,
+        "long": {},
+        "short": {},
+        "risk": {
+            "margin_usdt": float(prompt_meta.get("futures_margin_usdt") or cfg.order_margin_usdt),
+            "leverage": int(prompt_meta.get("leverage") or cfg.leverage),
+            "take_profit_pct": float(prompt_meta.get("take_profit_pct") or cfg.default_take_profit_pct),
+            "stop_loss_pct": float(prompt_meta.get("stop_loss_pct") or cfg.default_stop_loss_pct),
+            "tp_sl_mode": prompt_meta.get("tp_sl_mode") or "pnl_percent",
+        },
+    }
+    if prompt_meta.get("rsi_long_below") is not None:
+        plan["long"]["rsi_below"] = float(prompt_meta.get("rsi_long_below"))
+    if prompt_meta.get("rsi_short_above") is not None:
+        plan["short"]["rsi_above"] = float(prompt_meta.get("rsi_short_above"))
+
+    if high_wr:
+        # Defaults designed for higher winrate, not maximum trade count.
+        # They can be overridden by the one-time AI compiler if the prompt is more specific.
+        plan["long"].setdefault("rsi_below", 32)
+        plan["long"].setdefault("rsi_reclaim", 38)
+        plan["long"].setdefault("price_vs_ema", "above ema50")
+        plan["long"].setdefault("ema_alignment", "ema20_gt_ema50")
+        plan["long"].setdefault("trend_filter", "with_trend")
+        plan["long"].setdefault("max_distance_ema50_pct", 0.9)
+        plan["long"].setdefault("require_volume_not_low", True)
+
+        plan["short"].setdefault("rsi_above", 68)
+        plan["short"].setdefault("rsi_reject", 62)
+        plan["short"].setdefault("price_vs_ema", "below ema50")
+        plan["short"].setdefault("ema_alignment", "ema20_lt_ema50")
+        plan["short"].setdefault("trend_filter", "with_trend")
+        plan["short"].setdefault("max_distance_ema50_pct", 0.9)
+        plan["short"].setdefault("require_volume_not_low", True)
+
+        plan["risk"].setdefault("take_profit_pct", 6.0)
+        plan["risk"].setdefault("stop_loss_pct", 5.0)
+        plan["risk"].setdefault("cooldown_candles", 8)
+        plan["risk"].setdefault("min_atr_pct", 0.12)
+        plan["risk"].setdefault("max_atr_pct", 1.05)
+        plan["risk"].setdefault("require_volume_not_low", True)
+        plan["risk"].setdefault("avoid_against_ema200", False)
+    return plan
+
+
+def _strip_for_prompt_match(text: str) -> str:
+    try:
+        import unicodedata
+        raw = (text or "").replace("đ", "d").replace("Đ", "D").lower()
+        return "".join(ch for ch in unicodedata.normalize("NFD", raw) if unicodedata.category(ch) != "Mn")
+    except Exception:
+        return (text or "").lower()
+
+
+
+
+def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """Extract and parse the first balanced JSON object from model/user text."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE).strip()
+    raw = re.sub(r"\s*```$", "", raw).strip()
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        pass
+    start = raw.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i, ch in enumerate(raw[start:], start=start):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = raw[start:i + 1]
+                try:
+                    data = json.loads(candidate)
+                    return data if isinstance(data, dict) else None
+                except Exception:
+                    return None
+    return None
+
+
+def _normalize_backtest_strategy_json(data: Dict[str, Any], fallback: Dict[str, Any], cfg: BacktestConfig) -> Dict[str, Any]:
+    """Accept both compact engine plans and user-facing JSON strategy specs."""
+    if not isinstance(data, dict):
+        return fallback
+
+    if any(k in data for k in ["long", "short", "risk", "confirm_candles", "strategy_type"]):
+        merged_direct = _merge_backtest_plan(fallback, data)
+        # V60: preserve direct JSON so the universal condition evaluator can read
+        # custom indicators/entry_rules instead of losing them during merge.
+        merged_direct["raw_strategy_json"] = data
+        if isinstance(data.get("entry_rules"), dict) or isinstance(data.get("long_rule"), dict) or isinstance(data.get("short_rule"), dict) or isinstance(data.get("indicators"), dict):
+            merged_direct["strategy_type"] = data.get("strategy_type") or "generic_condition_engine"
+        return merged_direct
+
+    name = str(data.get("strategy_name") or data.get("name") or "").lower()
+    merged = dict(fallback)
+    merged["source"] = "direct_json_strategy" if data.get("strategy_name") else "ai_compiled_once"
+    merged["mode"] = "deterministic_backtest_plan"
+    merged["raw_strategy_json"] = data
+    # V60: generic direct JSON is evaluated by a universal indicator condition engine.
+    # Specialized strategies may override this below.
+    merged["strategy_type"] = data.get("strategy_type") or "generic_condition_engine"
+    market = data.get("market") if isinstance(data.get("market"), dict) else {}
+    if market.get("timeframe"):
+        merged["timeframe"] = str(market.get("timeframe"))
+
+    cap = data.get("capital") if isinstance(data.get("capital"), dict) else {}
+    tp_sl = data.get("tp_sl") if isinstance(data.get("tp_sl"), dict) else {}
+    limits = data.get("trade_limits") if isinstance(data.get("trade_limits"), dict) else {}
+    risk = dict(merged.get("risk") or {})
+    if cap.get("margin_per_trade_usdt") is not None:
+        risk["margin_usdt"] = cap.get("margin_per_trade_usdt")
+    if cap.get("max_leverage") is not None:
+        risk["leverage"] = cap.get("max_leverage")
+    if tp_sl.get("take_profit_price_percent") is not None:
+        risk["take_profit_pct"] = tp_sl.get("take_profit_price_percent")
+        risk["tp_sl_mode"] = "price_percent"
+    elif tp_sl.get("take_profit_pnl_on_margin") is not None:
+        risk["take_profit_pct"] = tp_sl.get("take_profit_pnl_on_margin")
+        risk["tp_sl_mode"] = "pnl_percent"
+    if tp_sl.get("stop_loss_price_percent") is not None:
+        risk["stop_loss_pct"] = tp_sl.get("stop_loss_price_percent")
+        risk["tp_sl_mode"] = "price_percent"
+    elif tp_sl.get("stop_loss_pnl_on_margin") is not None:
+        risk["stop_loss_pct"] = tp_sl.get("stop_loss_pnl_on_margin")
+        risk["tp_sl_mode"] = "pnl_percent"
+    if limits.get("cooldown_after_trade_candles") is not None:
+        risk["cooldown_candles"] = limits.get("cooldown_after_trade_candles")
+    if limits.get("minimum_confidence") is not None:
+        try:
+            conf = float(limits.get("minimum_confidence"))
+            merged["confidence"] = conf * 100 if conf <= 1 else conf
+        except Exception:
+            pass
+    merged["risk"] = risk
+
+    if "bollinger" in name or "vwap" in name or "mean_reversion" in name:
+        merged["strategy_type"] = "bollinger_vwap_mean_reversion"
+        inds = data.get("indicators") if isinstance(data.get("indicators"), dict) else {}
+        bb = inds.get("bollinger_bands") if isinstance(inds.get("bollinger_bands"), dict) else {}
+        rsi_cfg = inds.get("rsi") if isinstance(inds.get("rsi"), dict) else {}
+        adx_cfg = inds.get("adx") if isinstance(inds.get("adx"), dict) else {}
+        vol_cfg = inds.get("volume_ma") if isinstance(inds.get("volume_ma"), dict) else {}
+        merged["mean_reversion"] = {
+            "bb_period": int(bb.get("period") or 20),
+            "bb_stddev": float(bb.get("stddev") or 2),
+            "rsi_period": int(rsi_cfg.get("period") or 14),
+            "adx_period": int(adx_cfg.get("period") or 14),
+            "volume_ma_period": int(vol_cfg.get("period") or 20),
+            "adx_max": 22.0,
+            "adx_force_wait": 25.0,
+            "volume_min_ratio": 0.8,
+            "min_distance_to_vwap_pct": 0.35,
+            "long_rsi_max": 30.0,
+            "short_rsi_min": 70.0,
+            "block_band_walk_candles": 3,
+        }
+        return merged
+
+    return merged
+
+def _merge_backtest_plan(fallback: Dict[str, Any], ai_plan: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(ai_plan, dict):
+        return fallback
+    merged = dict(fallback)
+    for key in ["source", "mode", "timeframe", "confirm_candles", "confidence"]:
+        if ai_plan.get(key) not in (None, ""):
+            merged[key] = ai_plan.get(key)
+    for section in ["long", "short", "risk"]:
+        out = dict(merged.get(section) or {})
+        incoming = ai_plan.get(section) if isinstance(ai_plan.get(section), dict) else {}
+        out.update({k: v for k, v in incoming.items() if v not in (None, "")})
+        merged[section] = out
+    merged["source"] = ai_plan.get("source") or "ai_compiled_once"
+    return merged
+
+
+async def _compile_backtest_plan_once(settings: Dict[str, Any], prompt: str, prompt_meta: Dict[str, Any], cfg: BacktestConfig) -> tuple[Dict[str, Any], int, str]:
+    """Call AI once to turn the user prompt into a deterministic backtest plan.
+
+    The returned plan is then evaluated by BacktestPlanEvaluator for all candles.
+    This is the cost-saving mode the user requested: one AI call for strategy
+    interpretation, zero AI calls for every historical candle.
+    """
+    fallback = _fallback_backtest_plan_from_meta(prompt_meta, cfg)
+    direct_json = _extract_first_json_object(prompt)
+    if isinstance(direct_json, dict):
+        return _normalize_backtest_strategy_json(direct_json, fallback, cfg), 0, "Dùng JSON strategy trực tiếp từ prompt, không cần gọi AI compile."
+    engine = make_engine(settings)
+    if not engine.enabled:
+        return fallback, 0, "OPENAI_API_KEY chưa cấu hình; dùng local parser plan."
+
+    system = (
+        "You are a trading strategy compiler for a backtest engine. "
+        "Convert the user's natural-language strategy into ONE deterministic JSON plan. "
+        "Do not return a trading signal. Do not include prose. "
+        "Only output a JSON object with this shape: "
+        "{source, mode, timeframe, confirm_candles, confidence, "
+        "long:{rsi_below, rsi_reclaim, price_vs_ema, ema_alignment, trend_filter, max_distance_ema50_pct, require_volume_not_low}, "
+        "short:{rsi_above, rsi_reject, price_vs_ema, ema_alignment, trend_filter, max_distance_ema50_pct, require_volume_not_low}, "
+        "risk:{margin_usdt, leverage, take_profit_pct, stop_loss_pct, tp_sl_mode, cooldown_candles, min_atr_pct, max_atr_pct, require_volume_not_low, avoid_against_ema200}}. "
+        "If a rule is not explicitly present, omit it. "
+        "If the user asks for high winrate, prefer fewer trades, stricter EMA/trend filters, RSI reclaim/reject, volume-not-low, ATR band, and cooldown. "
+        "For Vietnamese prompts, '2 cây nến xanh' means confirm_candles=2 for long; "
+        "'2 cây nến đỏ' means confirm_candles=2 for short. "
+        "TP/SL percent in futures prompts should usually use tp_sl_mode='pnl_percent'."
+    )
+    user_payload = {
+        "mode": "compile_backtest_plan_once",
+        "strategy_prompt": prompt,
+        "local_parser_directives": prompt_meta,
+        "backtest_config": {
+            "symbol": cfg.symbol,
+            "category": cfg.category,
+            "interval": cfg.interval,
+            "initial_capital": cfg.initial_capital,
+            "order_margin_usdt": cfg.order_margin_usdt,
+            "leverage": cfg.leverage,
+            "default_take_profit_pct": cfg.default_take_profit_pct,
+            "default_stop_loss_pct": cfg.default_stop_loss_pct,
+        },
+    }
+    try:
+        response = await engine._plain_chat_completion({
+            "model": engine.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+            ],
+        }, max_output_tokens=900, temperature=0.0)
+        content = (response.choices[0].message.content or "").strip()
+        # Some models wrap JSON in markdown. Strip it defensively.
+        content = re.sub(r"^```(?:json)?\\s*", "", content, flags=re.IGNORECASE).strip()
+        content = re.sub(r"\\s*```$", "", content).strip()
+        data = json.loads(content)
+        if not isinstance(data, dict):
+            raise ValueError("AI plan is not a JSON object")
+        return _merge_backtest_plan(fallback, data), 1, "AI đã compile strategy thành plan 1 lần."
+    except Exception as exc:
+        fallback["source"] = "local_parser_after_ai_plan_error"
+        fallback["compile_error"] = f"{type(exc).__name__}: {str(exc)[:240]}"
+        return fallback, 1, f"AI plan lỗi, dùng local parser plan: {type(exc).__name__}: {str(exc)[:180]}"
+
+
+async def _backtest_decide_for_current_app(
+    *,
+    settings: Dict[str, Any],
+    prompt: str,
+    prompt_meta: Dict[str, Any],
+    guard: RiskGuard,
+    context: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Use the same strategy parser + DecisionEngine path as the live bot.
+
+    This function intentionally returns a decision only. BacktestEngine owns the
+    fake broker, TP/SL simulation, fee/slippage and PNL calculation. It never
+    calls execute_action() and never sends orders to Bybit.
+    """
+    ai_snapshot = {"symbols": _compact_snapshot_for_ai(context.get("snapshots") or {}, prompt_meta)}
+    fallback = _action_from_prompt_directives(prompt, prompt_meta)
+    use_cost_saver = bool(settings.get("ai_cost_saver", True))
+    has_indicator_condition = bool(prompt_meta.get("rsi_rules") or prompt_meta.get("indicators"))
+    risk_config = guard.public_config()
+    risk_config.update({
+        "mode": "backtest",
+        "current_equity": context.get("equity"),
+        "daily_trade_count": context.get("daily_trades"),
+        "daily_losing_streak": context.get("daily_losing_streak"),
+        "note": "Backtest mode: no live Bybit order is allowed.",
+    })
+
+    if use_cost_saver and fallback and not has_indicator_condition:
+        raw_decision = fallback
+    else:
+        engine = make_engine(settings)
+        if not engine.enabled:
+            raw_decision = fallback or {
+                "action": "WAIT",
+                "symbol": context.get("config", {}).get("symbol") or "BTCUSDT",
+                "category": context.get("config", {}).get("category") or "linear",
+                "confidence": 0,
+                "reason": "Backtest cần OpenAI API Key để chạy AI decision. Prompt này không phải rule deterministic nên trả WAIT.",
+            }
+        else:
+            raw_decision = await engine.decide(
+                prompt=prompt,
+                snapshot=ai_snapshot,
+                risk_config=risk_config,
+                skill_context=("" if _is_prompt_only_mode(prompt_meta) else build_skill_context(mode="strategy_loop", command_or_prompt=prompt)),
+                prompt_directives=prompt_meta,
+            )
+            if is_wait_action(raw_decision) and fallback:
+                raw_decision = fallback
+    raw_decision = _apply_prompt_tp_sl_constraints(raw_decision, prompt_meta)
+    return raw_decision
+
+
+@app.post("/api/backtest/run")
+async def run_backtest_api(payload: BacktestRunIn, user: Dict[str, Any] = Depends(current_user)) -> Dict[str, Any]:
+    runtime = runtimes.get(int(user["id"]))
+    ws = get_workspace(int(user["id"]), redact=False)
+    settings = ws["settings"]
+    guard = make_risk_guard(settings, runtime)
+    allowed_symbols = allowed_symbols_from_guard(guard)
+    prompt = (payload.strategy_prompt or ws.get("prompt") or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Thiếu strategy prompt để backtest.")
+
+    symbols = parse_backtest_symbol_list(payload.symbol, allowed_symbols)
+    category = str(payload.category or "linear").lower().strip()
+    if category == "auto":
+        category = "linear"
+    if category not in {"linear", "spot", "inverse"}:
+        raise HTTPException(status_code=400, detail="Category backtest chỉ hỗ trợ linear, spot hoặc inverse.")
+
+    # Use all allowed symbols for prompt parsing so prompts mentioning multiple
+    # coins do not become invalid. The actual run symbol is assigned per engine.
+    prompt_meta = parse_strategy_prompt(prompt, allowed_symbols or symbols)
+    cfg_base = BacktestConfig(
+        symbol=symbols[0],
+        category=category,
+        interval=str(payload.interval or "5"),
+        start_time=payload.start_time,
+        end_time=payload.end_time,
+        strategy_prompt=prompt,
+        initial_capital=float(payload.initial_capital or 50),
+        order_margin_usdt=float(payload.order_margin_usdt or payload.initial_capital or 10),
+        leverage=max(1, min(int(payload.leverage or 1), int(guard.config.max_leverage or payload.leverage or 1))),
+        fee_rate=float(payload.fee_rate or 0),
+        slippage_rate=float(payload.slippage_rate or 0),
+        max_trades_per_day=max(1, int(payload.max_trades_per_day or guard.config.max_daily_trades or 5)),
+        max_losing_streak_per_day=max(1, int(payload.max_losing_streak_per_day or 2)),
+        default_take_profit_pct=float(payload.default_take_profit_pct or settings.get("default_take_profit_pct") or 10),
+        default_stop_loss_pct=float(payload.default_stop_loss_pct or settings.get("default_stop_loss_pct") or 5),
+        confidence_threshold=float(payload.confidence_threshold or 0.58),
+        entry_cooldown_candles=max(0, int(payload.entry_cooldown_candles or 0)),
+        lookback_candles=int(payload.lookback_candles or 220),
+        max_ai_candles=int(payload.max_ai_candles or 500),
+        decision_mode=str(payload.decision_mode or "ai_once").lower().strip(),
+    )
+
+    backtest_plan = None
+    plan_ai_calls = 0
+    plan_note = ""
+    if cfg_base.decision_mode == "ai_once":
+        # One AI call only: compile the strategy once, then reuse the plan for
+        # every symbol/candle. This keeps multi-symbol backtests cheap.
+        backtest_plan, plan_ai_calls, plan_note = await _compile_backtest_plan_once(settings, prompt, prompt_meta, cfg_base)
+    elif cfg_base.decision_mode == "rule":
+        backtest_plan = _fallback_backtest_plan_from_meta(prompt_meta, cfg_base)
+        plan_note = "Rule mode: dùng local parser/rule engine, không gọi AI."
+    else:
+        cfg_base.decision_mode = "ai_each"
+        plan_note = "AI each-candle mode: gọi AI theo từng nến trong giới hạn max_ai_candles."
+
+    client = make_client(settings)
+    reports = []
+    await runtime.log("INFO", f"Backtest bắt đầu: {cfg_base.category}:{' '.join(symbols)} {cfg_base.interval} · {cfg_base.start_time} → {cfg_base.end_time} · vốn {cfg_base.initial_capital} USDT/symbol · margin {cfg_base.order_margin_usdt} USDT · mode={cfg_base.decision_mode}.")
+    if plan_note:
+        await runtime.log("INFO", f"Backtest plan: {plan_note}")
+
+    try:
+        for idx, symbol in enumerate(symbols):
+            cfg = BacktestConfig(**asdict(cfg_base))
+            cfg.symbol = symbol
+            backtester = BacktestEngine(
+                client=client,
+                prompt_meta=prompt_meta,
+                backtest_plan=backtest_plan,
+                plan_ai_calls=(plan_ai_calls if idx == 0 else 0),
+                decide_fn=lambda context: _backtest_decide_for_current_app(
+                    settings=settings,
+                    prompt=prompt,
+                    prompt_meta=prompt_meta,
+                    guard=guard,
+                    context=context,
+                ),
+            )
+            reports.append(await backtester.run(cfg))
+    except Exception as exc:
+        await runtime.log("ERROR", f"Backtest lỗi: {type(exc).__name__}: {exc}")
+        raise HTTPException(status_code=400, detail=f"Backtest lỗi: {exc}")
+
+    combined = aggregate_backtest_reports(reports, symbols, cfg_base, plan_ai_calls=plan_ai_calls)
+    m = combined["metrics"]
+    await runtime.log("INFO", f"Backtest xong: winrate {m.get('winrate')}% · PNL {m.get('pnl_usdt')} USDT ({m.get('pnl_pct')}%) · trades {m.get('total_trades')} · symbols {', '.join(symbols)}.")
+    return json_safe({
+        "ok": True,
+        "metrics": combined["metrics"],
+        "trades": combined["trades"],
+        "logs": combined["logs"],
+        "config": combined["config"],
+        "prompt_meta": prompt_meta,
+        "meta_summary": summarize_strategy_directives(prompt_meta),
+        "backtest_plan": backtest_plan,
+        "plan_note": plan_note,
+    })
+
 @app.get("/", response_class=HTMLResponse)
 async def home() -> str:
-    with open("templates/index.html", "r", encoding="utf-8") as f:
-        return f.read()
+    index_path = TEMPLATES_DIR / "index.html"
+    if index_path.exists():
+        return index_path.read_text(encoding="utf-8")
+    return """
+    <!doctype html>
+    <html lang="vi">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>CIG AI Subaccount</title>
+        <style>
+          body{font-family:Arial,sans-serif;background:#0b1020;color:#e8eefc;margin:0;padding:40px}
+          .box{max-width:760px;margin:auto;background:#121a33;border:1px solid #26345f;border-radius:18px;padding:28px}
+          code{background:#0b1020;padding:2px 6px;border-radius:6px}
+        </style>
+      </head>
+      <body>
+        <div class="box">
+          <h1>CIG AI Subaccount</h1>
+          <p>App đã khởi động, nhưng thiếu file <code>templates/index.html</code> trong image deploy.</p>
+          <p>Hãy redeploy đúng gói source có thư mục <code>templates/</code> và <code>static/</code>.</p>
+        </div>
+      </body>
+    </html>
+    """
 
 
 @app.post("/api/register")

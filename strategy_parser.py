@@ -118,12 +118,41 @@ def _parse_timeframe(ascii_text: str) -> str:
         for m in re.finditer(pattern, ascii_text, flags=re.IGNORECASE):
             a, b = m.group(1), m.group(2)
             add(f'{a}{b}' if a.isdigit() else f'{b}{a}')
+<<<<<<< HEAD
 
     if found:
         order = ['1D', '4H', '1H', '30M', '15M', '5M']
         found = sorted(found, key=lambda x: order.index(x) if x in order else 99)
         return '/'.join(found[:4])
     return ''
+=======
+>>>>>>> 78582718eada4d79132653992ba32f60d5dbdc92
+
+    if found:
+        order = ['1D', '4H', '1H', '30M', '15M', '5M']
+        found = sorted(found, key=lambda x: order.index(x) if x in order else 99)
+        return '/'.join(found[:4])
+    return ''
+
+def _positive_strategy_text(ascii_text: str) -> str:
+    """Return text with negative/forbidden clauses masked out for parser extraction.
+
+    Users often write prompts like "Không được dùng D1/H4/H1/EMA/MACD".
+    The old parser still detected those forbidden words as requested timeframes/
+    indicators. This helper is used only for extraction of requested data scope.
+    It keeps the original prompt untouched for AI/rule logic.
+    """
+    t = "\n" + (ascii_text or "") + "\n"
+    # Remove short clauses/sentences that explicitly forbid using something.
+    forbidden_patterns = [
+        r'\n\s*[-*]?\s*khong\s+(?:duoc\s+)?(?:dung|su\s*dung|xai|can|lay)[^\n\.。;]{0,180}',
+        r'\n\s*[-*]?\s*cam\s+(?:dung|su\s*dung|xai)[^\n\.。;]{0,180}',
+        r'\n\s*[-*]?\s*do\s+not\s+(?:use|send|include)[^\n\.。;]{0,180}',
+        r'\n\s*[-*]?\s*never\s+(?:use|send|include)[^\n\.。;]{0,180}',
+    ]
+    for pat in forbidden_patterns:
+        t = re.sub(pat, '\n ', t, flags=re.IGNORECASE)
+    return t.strip()
 
 def _parse_pct(label_patterns: List[str], ascii_text: str) -> Optional[str]:
     for pattern in label_patterns:
@@ -137,6 +166,7 @@ def _parse_pct(label_patterns: List[str], ascii_text: str) -> Optional[str]:
 def parse_strategy_prompt(prompt: str, allowed_symbols: Optional[List[str]] = None) -> Dict[str, Any]:
     original = (prompt or '').strip()
     ascii_text = _strip_accents(original.lower())
+    positive_text = _positive_strategy_text(ascii_text)
     out: Dict[str, Any] = {
         'symbols': _find_symbols(original, allowed_symbols),
         'market': '',
@@ -161,12 +191,22 @@ def parse_strategy_prompt(prompt: str, allowed_symbols: Optional[List[str]] = No
         'rsi_long_below': None,
         'rsi_short_above': None,
         'candle_confirm_count': None,
+<<<<<<< HEAD
+        'max_batch_orders': None,
+=======
+>>>>>>> 78582718eada4d79132653992ba32f60d5dbdc92
     }
 
     interval_seconds, interval_label = _parse_interval_seconds(ascii_text)
     out['interval_seconds'] = interval_seconds
     out['interval_label'] = interval_label
+<<<<<<< HEAD
+    # Parse requested timeframe from positive instructions only.
+    # Do not treat forbidden phrases like 'không dùng D1/H4/H1/M15' as requested TFs.
+    out['timeframe'] = _parse_timeframe(positive_text)
+=======
     out['timeframe'] = _parse_timeframe(ascii_text)
+>>>>>>> 78582718eada4d79132653992ba32f60d5dbdc92
     tf_text = str(out.get('timeframe') or '').upper()
     if '5M' in tf_text:
         out['primary_timeframe'] = '5m'
@@ -332,8 +372,10 @@ def parse_strategy_prompt(prompt: str, allowed_symbols: Optional[List[str]] = No
         out['requires_explicit_tp_sl'] = True
 
     indicators = []
+    # Parse requested indicators from positive instructions only.
+    # Example: 'Không được dùng EMA/MACD/ATR' must not become requested EMA/MACD/ATR.
     for key in ['rsi', 'ema', 'macd', 'atr', 'volume', 'vol', 'bollinger', 'bb', 'sma']:
-        if key in ascii_text:
+        if key in positive_text:
             indicators.append(key.upper())
     out['indicators'] = list(dict.fromkeys(indicators))
     out['allowed_indicators'] = list(out['indicators'])
@@ -348,7 +390,11 @@ def parse_strategy_prompt(prompt: str, allowed_symbols: Optional[List[str]] = No
         tf_map = {'5M':'5m','15M':'15m','30M':'30m','1H':'1h','4H':'4h','1D':'1d'}
         out['allowed_timeframes'] = [tf_map[x] for x in str(out.get('timeframe')).upper().split('/') if x in tf_map]
     indicator_words = ['rsi','ema','macd','atr','volume','vol','bollinger','bb','sma','vwap']
+<<<<<<< HEAD
+    if out.get('allowed_timeframes') or any(k in positive_text for k in indicator_words):
+=======
     if out.get('allowed_timeframes') or any(k in ascii_text for k in indicator_words):
+>>>>>>> 78582718eada4d79132653992ba32f60d5dbdc92
         out['prompt_only_mode'] = True
         out['strict_prompt_only'] = True
 
@@ -425,6 +471,16 @@ def parse_strategy_prompt(prompt: str, allowed_symbols: Optional[List[str]] = No
     if candle_rules:
         out['candle_rules'] = candle_rules
 
+<<<<<<< HEAD
+    # Optional multi-symbol batch cap, e.g. "tối đa 2 lệnh mỗi vòng quét".
+    batch_match = re.search(r'(?:toi\s*da|max)[^\n]{0,50}?(\d+)\s*(?:lenh|order|trade)[^\n]{0,50}?(?:vong|scan|quet|loop)', ascii_text, flags=re.IGNORECASE)
+    if batch_match:
+        val = _num_or_none(batch_match.group(1))
+        if val is not None:
+            out['max_batch_orders'] = int(max(1, min(int(val), 10)))
+
+=======
+>>>>>>> 78582718eada4d79132653992ba32f60d5dbdc92
     # Strict low-timeframe RSI+candle strategies must not be rewritten by any
     # default D1/H4/H1 strategy prompt. Example: "RSI 5m < 27 + 2 green candles => Long; RSI 5m > 66 + 2 red candles => Short".
     # When this is detected, execution code uses only 5m RSI + candle colors;
@@ -446,9 +502,23 @@ def parse_strategy_prompt(prompt: str, allowed_symbols: Optional[List[str]] = No
             out['exact_rsi_candle_strategy'] = True
             out['strict_prompt_only'] = True
             out['prompt_only_mode'] = True
+<<<<<<< HEAD
+            # Hard override data scope for exact RSI 5m candle strategy.
+            # This prevents both the summary and runtime snapshot from drifting
+            # to D1/H4/H1/M15 or EMA/MACD/ATR mentioned only in forbidden clauses.
+            out['timeframe'] = '5M'
+            out['primary_timeframe'] = '5m'
+            out['allowed_timeframes'] = ['5m']
+            out['indicators'] = ['RSI']
+            out['allowed_indicators'] = ['RSI']
+            out['requires_explicit_tp_sl'] = False
+            if out.get('take_profit_pct') or out.get('stop_loss_pct'):
+                out['tp_sl_mode'] = 'pnl_percent'
+=======
             out['primary_timeframe'] = out.get('primary_timeframe') or '5m'
             out['allowed_timeframes'] = ['5m']
             out['allowed_indicators'] = ['RSI']
+>>>>>>> 78582718eada4d79132653992ba32f60d5dbdc92
             out['candle_confirm_count'] = 2
     return out
 
@@ -465,7 +535,10 @@ def summarize_strategy_directives(meta: Dict[str, Any]) -> str:
         parts.append('Coin: ' + ', '.join(meta['symbols']))
     if meta.get('interval_seconds'):
         parts.append(f"Chu kỳ: {meta.get('interval_label')} ({meta['interval_seconds']} giây)")
-    if meta.get('timeframe'):
+    if meta.get('prompt_only_mode') and meta.get('allowed_timeframes'):
+        tf_labels = {'5m': '5M', '15m': '15M', '30m': '30M', '1h': '1H', '4h': '4H', '1d': '1D'}
+        parts.append('Khung phân tích: ' + '/'.join(tf_labels.get(str(x).lower(), str(x).upper()) for x in meta.get('allowed_timeframes') or []))
+    elif meta.get('timeframe'):
         parts.append('Khung phân tích: ' + str(meta['timeframe']).upper())
     if meta.get('leverage'):
         parts.append(f"Đòn bẩy: {meta['leverage']}x")
@@ -477,11 +550,19 @@ def summarize_strategy_directives(meta: Dict[str, Any]) -> str:
         parts.append(f"TP: {meta['take_profit_pct']}%")
     if meta.get('stop_loss_pct'):
         parts.append(f"SL: {meta['stop_loss_pct']}%")
+<<<<<<< HEAD
+    if meta.get('tp_sl_mode') == 'pnl_percent':
+        parts.append('TP/SL: tính theo % PNL trên margin')
+    elif meta.get('requires_explicit_tp_sl'):
+=======
     if meta.get('requires_explicit_tp_sl'):
+>>>>>>> 78582718eada4d79132653992ba32f60d5dbdc92
         parts.append('TP/SL: yêu cầu giá cụ thể, không dùng mặc định')
     if meta.get('rsi_rules'):
         parts.append('RSI: ' + '; '.join(meta['rsi_rules'][:2]))
-    if meta.get('indicators'):
+    if meta.get('prompt_only_mode') and meta.get('allowed_indicators'):
+        parts.append('Chỉ báo: ' + ', '.join((meta.get('allowed_indicators') or [])[:5]))
+    elif meta.get('indicators'):
         parts.append('Chỉ báo: ' + ', '.join(meta['indicators'][:5]))
     if meta.get('prompt_only_mode'):
         tfs = ','.join(meta.get('allowed_timeframes') or []) or (meta.get('primary_timeframe') or '-')
